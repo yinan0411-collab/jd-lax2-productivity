@@ -4,4 +4,3 @@ numpy>=2.0
 openpyxl>=3.1
 xlsxwriter>=3.2
 xlrd>=2.0
-supabase>=2.0,<3.0
