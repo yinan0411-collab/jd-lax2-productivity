@@ -57,6 +57,16 @@ PACKING_COLUMNS = {
     "employee": "打包人姓名",
 }
 
+PUTAWAY_COLUMNS = {
+    "pi": "京东入库单号",
+    "operation_type": "作业类型",
+    "container": "上架容器号",
+    "quantity": "上架量",
+    "area_name": "储区名称",
+    "operator": "上架员",
+    "time": "上架时间",
+}
+
 PICKING_RANK_GROUP_ORDER = ["1st Shift", "2nd Shift", "其他组"]
 PACKING_RANK_GROUP_ORDER = [
     "出库-打包-Babylist",
@@ -133,6 +143,29 @@ class PackingResult:
     valid_row_count: int
     invalid_row_count: int
     excluded_unmatched_rows: int
+
+
+@dataclass(frozen=True)
+class PutawayResult:
+    ranking: pd.DataFrame
+    file_summary: pd.DataFrame
+    total_pieces: float
+    total_pis: int
+    total_containers: int
+    total_effective_seconds: float
+    overall_container_piece_ratio: float
+    overall_pi_container_ratio: float
+    overall_hourly_pis: float
+    overall_hourly_containers: float
+    overall_hourly_pieces: float
+    operator_count: int
+    uploaded_row_count: int
+    deduplicated_row_count: int
+    valid_row_count: int
+    robot_row_count: int
+    invalid_row_count: int
+    excluded_unmatched_rows: int
+    operation_type: str
 
 
 def normalize_column_label(value: object) -> str:
@@ -859,6 +892,225 @@ def combine_packing_files(uploaded_files: Sequence[object]) -> tuple[pd.DataFram
     return combined, file_summary
 
 
+def combine_putaway_files(uploaded_files: Sequence[object]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    frames: list[pd.DataFrame] = []
+    summary_rows: list[dict[str, object]] = []
+    required = tuple(PUTAWAY_COLUMNS.values())
+
+    for file_index, uploaded in enumerate(uploaded_files):
+        file_bytes = uploaded.getvalue()
+        file_name = uploaded.name
+        try:
+            frame = read_excel_sheet(file_bytes, file_name, 0, required)
+        except ValueError as exc:
+            raise ValueError(f"文件“{file_name}”缺少必要字段或读取失败：{exc}") from exc
+
+        original_rows = len(frame)
+        # Keep legitimate identical rows within one source file. The occurrence
+        # number removes only repeated copies caused by overlapping uploads.
+        frame["_文件内重复序号"] = frame.groupby(
+            list(required), sort=False, dropna=False
+        ).cumcount()
+        frame["_来源文件序号"] = file_index
+        frame["来源文件"] = file_name
+        frames.append(frame)
+        summary_rows.append({"文件名": file_name, "读取行数": original_rows})
+
+    if not frames:
+        raise ValueError("请至少上传一个上架文件。")
+
+    combined = pd.concat(frames, ignore_index=True)
+    file_summary = pd.DataFrame(summary_rows)
+    return combined, file_summary
+
+
+def calculate_putaway_productivity(
+    combined_df: pd.DataFrame,
+    file_summary: pd.DataFrame,
+    employee_lookup: EmployeeLookup | None,
+    gap_minutes: int,
+    operation_type: str = "全部",
+) -> PutawayResult:
+    required = list(PUTAWAY_COLUMNS.values())
+    missing = [column for column in required if column not in combined_df.columns]
+    if missing:
+        raise ValueError("上架表缺少必要字段：" + "、".join(missing))
+
+    uploaded_row_count = len(combined_df)
+
+    dedupe_key = required.copy()
+    if "_文件内重复序号" in combined_df.columns:
+        dedupe_key.append("_文件内重复序号")
+    work = combined_df.drop_duplicates(subset=dedupe_key, keep="first").copy()
+    deduplicated_row_count = len(work)
+
+    work["作业类型标准值"] = work[PUTAWAY_COLUMNS["operation_type"]].map(clean_name)
+    robot_mask = (
+        work[PUTAWAY_COLUMNS["area_name"]].map(canonical_key).eq("robot")
+        | work[PUTAWAY_COLUMNS["operator"]].map(canonical_key).eq("tmc_call")
+    )
+    robot_row_count = int(robot_mask.sum())
+    work = work.loc[~robot_mask].copy()
+
+    if operation_type and operation_type != "全部":
+        work = work.loc[work["作业类型标准值"].eq(operation_type)].copy()
+
+    work["上架人账号"] = work[PUTAWAY_COLUMNS["operator"]].map(extract_operator_id)
+    work["实际姓名"] = work["上架人账号"].map(
+        lambda value: match_employee_name(value, employee_lookup)
+    )
+    work["考勤组"] = work["上架人账号"].map(
+        lambda value: match_employee_attendance_group(value, employee_lookup)
+    )
+    work["PI标准值"] = work[PUTAWAY_COLUMNS["pi"]].map(clean_identifier)
+    work["容器号标准值"] = work[PUTAWAY_COLUMNS["container"]].map(clean_identifier)
+    work["上架件量数值"] = pd.to_numeric(
+        work[PUTAWAY_COLUMNS["quantity"]], errors="coerce"
+    )
+    work["上架完成时间"] = pd.to_datetime(
+        work[PUTAWAY_COLUMNS["time"]], errors="coerce"
+    )
+
+    valid_mask = (
+        work["上架人账号"].ne("")
+        & work["PI标准值"].ne("")
+        & work["容器号标准值"].ne("")
+        & work["上架件量数值"].notna()
+        & work["上架完成时间"].notna()
+        & (work["上架件量数值"] >= 0)
+    )
+    invalid_row_count = int((~valid_mask).sum())
+    work = work.loc[valid_mask].copy()
+
+    excluded_unmatched_rows = int(work["实际姓名"].eq("").sum())
+    valid = work.loc[work["实际姓名"].ne("")].copy()
+    if valid.empty:
+        selected_label = f"（作业类型：{operation_type}）" if operation_type != "全部" else ""
+        raise ValueError(
+            f"排除Robot、无效数据和未匹配人员后{selected_label}，没有可计算的上架记录。"
+        )
+
+    # A container is the core unit of putaway work. If a container contains
+    # multiple product rows, sum its pieces and use its latest timestamp as the
+    # completion event.
+    container_events = (
+        valid.groupby(
+            ["上架人账号", "实际姓名", "考勤组", "PI标准值", "容器号标准值"],
+            as_index=False,
+        )
+        .agg(
+            上架件量=("上架件量数值", "sum"),
+            容器完成时间=("上架完成时间", "max"),
+        )
+    )
+
+    duration = calculate_gap_based_seconds(
+        container_events,
+        "上架人账号",
+        "容器完成时间",
+        gap_minutes,
+    ).rename(columns={"账号": "上架人账号", "秒数": "有效上架秒数"})
+
+    summary = (
+        container_events.groupby(["上架人账号", "实际姓名", "考勤组"], as_index=False)
+        .agg(
+            上架件量=("上架件量", "sum"),
+            上架单量=("PI标准值", "nunique"),
+            上架容器量=("容器号标准值", "nunique"),
+        )
+    )
+    summary = summary.merge(duration, on="上架人账号", how="left")
+    summary["有效上架秒数"] = summary["有效上架秒数"].fillna(0.0)
+    summary["有效上架小时"] = summary["有效上架秒数"] / 3600
+    summary["容器件比"] = np.where(
+        summary["上架容器量"] > 0,
+        summary["上架件量"] / summary["上架容器量"],
+        np.nan,
+    )
+    summary["PI容器比"] = np.where(
+        summary["上架单量"] > 0,
+        summary["上架容器量"] / summary["上架单量"],
+        np.nan,
+    )
+    summary["人效（小时单量）"] = np.where(
+        summary["有效上架小时"] > 0,
+        summary["上架单量"] / summary["有效上架小时"],
+        np.nan,
+    )
+    summary["小时上架容器量"] = np.where(
+        summary["有效上架小时"] > 0,
+        summary["上架容器量"] / summary["有效上架小时"],
+        np.nan,
+    )
+    summary["人效（小时件效）"] = np.where(
+        summary["有效上架小时"] > 0,
+        summary["上架件量"] / summary["有效上架小时"],
+        np.nan,
+    )
+    summary["有效上架时长"] = summary["有效上架秒数"].map(format_duration)
+
+    summary = summary.sort_values(
+        ["上架容器量", "上架件量", "小时上架容器量"],
+        ascending=[False, False, False],
+        na_position="last",
+    ).reset_index(drop=True)
+    summary.insert(0, "排名", np.arange(1, len(summary) + 1))
+
+    ranking = summary[
+        [
+            "排名",
+            "上架人账号",
+            "实际姓名",
+            "考勤组",
+            "上架件量",
+            "上架单量",
+            "上架容器量",
+            "容器件比",
+            "PI容器比",
+            "有效上架时长",
+            "人效（小时单量）",
+            "小时上架容器量",
+            "人效（小时件效）",
+        ]
+    ].copy()
+
+    total_pieces = float(container_events["上架件量"].sum())
+    total_pis = int(container_events["PI标准值"].nunique())
+    total_containers = int(container_events["容器号标准值"].nunique())
+    total_effective_seconds = float(summary["有效上架秒数"].sum())
+    total_hours = total_effective_seconds / 3600
+
+    return PutawayResult(
+        ranking=ranking,
+        file_summary=file_summary,
+        total_pieces=total_pieces,
+        total_pis=total_pis,
+        total_containers=total_containers,
+        total_effective_seconds=total_effective_seconds,
+        overall_container_piece_ratio=(
+            total_pieces / total_containers if total_containers else float("nan")
+        ),
+        overall_pi_container_ratio=(
+            total_containers / total_pis if total_pis else float("nan")
+        ),
+        overall_hourly_pis=(total_pis / total_hours if total_hours else float("nan")),
+        overall_hourly_containers=(
+            total_containers / total_hours if total_hours else float("nan")
+        ),
+        overall_hourly_pieces=(
+            total_pieces / total_hours if total_hours else float("nan")
+        ),
+        operator_count=len(summary),
+        uploaded_row_count=uploaded_row_count,
+        deduplicated_row_count=deduplicated_row_count,
+        valid_row_count=len(valid),
+        robot_row_count=robot_row_count,
+        invalid_row_count=invalid_row_count,
+        excluded_unmatched_rows=excluded_unmatched_rows,
+        operation_type=operation_type,
+    )
+
+
 def calculate_gap_based_seconds(
     order_events: pd.DataFrame,
     operator_col: str,
@@ -1257,11 +1509,86 @@ def make_packing_excel(result: PackingResult, gap_minutes: int) -> bytes:
         method_sheet.set_column("B:B", 110)
     return output.getvalue()
 
+def make_putaway_excel(result: PutawayResult, gap_minutes: int) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        result.ranking.to_excel(writer, sheet_name="上架人效排名", index=False)
+        result.file_summary.to_excel(writer, sheet_name="上传文件汇总", index=False)
+        method = pd.DataFrame(
+            {
+                "项目": [
+                    "多文件合并",
+                    "Robot排除",
+                    "作业类型",
+                    "考勤组",
+                    "上架件量",
+                    "上架单量",
+                    "上架容器量",
+                    "容器件比",
+                    "PI容器比",
+                    "容器完成时间",
+                    "有效上架时长",
+                    "连续上架阈值",
+                    "人效（小时单量）",
+                    "小时上架容器量",
+                    "人效（小时件效）",
+                    "排名规则",
+                    "人员范围",
+                ],
+                "计算口径": [
+                    "允许同时上传多个文件；仅删除因文件时间范围重叠而重复出现的明细，单个源文件内的原始行保持不变",
+                    "储区名称等于Robot或上架员等于TMC_CALL的记录全部排除",
+                    f"当前选择：{result.operation_type}；选择全部时合并所有非Robot作业类型",
+                    "从人员主数据中的考勤组字段匹配；源数据为空时结果保持为空",
+                    "上架量合计",
+                    "京东入库单号（PI）去重数量；一个PI可以包含多个容器",
+                    "上架容器号去重数量，作为上架环节的主要完成量",
+                    "上架件量 ÷ 上架容器量",
+                    "上架容器量 ÷ 上架单量",
+                    "同一容器出现多条商品明细时，使用最晚上架时间作为该容器的完成时间",
+                    "按人员和自然日排列容器完成时间；相邻容器间隔不超过阈值时，该间隔计入有效上架时长",
+                    f"当前设置为 {gap_minutes} 分钟；超过阈值的空档不计入有效上架时长",
+                    "上架单量 ÷ 有效上架小时（PI/小时，越高越好）",
+                    "上架容器量 ÷ 有效上架小时（容器/小时，越高越好）",
+                    "上架件量 ÷ 有效上架小时（件/小时，越高越好）",
+                    "按照实际完成的上架容器量从高到低排名；容器量相同时依次参考上架件量和小时上架容器量",
+                    "仅保留成功匹配人员主数据的员工",
+                ],
+            }
+        )
+        method.to_excel(writer, sheet_name="计算口径", index=False)
+
+        workbook = writer.book
+        fmt = _excel_formats(workbook)
+        sheet = writer.sheets["上架人效排名"]
+        sheet.freeze_panes(1, 0)
+        sheet.autofilter(0, 0, len(result.ranking), len(result.ranking.columns) - 1)
+        sheet.set_row(0, 24, fmt["header"])
+        widths = [8, 22, 22, 22, 14, 12, 14, 12, 12, 18, 18, 20, 18]
+        for col_idx, width in enumerate(widths):
+            sheet.set_column(col_idx, col_idx, width)
+        sheet.set_column(0, 0, 8, fmt["integer"])
+        sheet.set_column(4, 6, 14, fmt["integer"])
+        sheet.set_column(7, 8, 12, fmt["decimal"])
+        sheet.set_column(10, 12, 20, fmt["decimal"])
+
+        file_sheet = writer.sheets["上传文件汇总"]
+        file_sheet.set_row(0, 24, fmt["header"])
+        file_sheet.set_column("A:A", 45)
+        file_sheet.set_column("B:B", 14, fmt["integer"])
+
+        method_sheet = writer.sheets["计算口径"]
+        method_sheet.set_row(0, 24, fmt["header"])
+        method_sheet.set_column("A:A", 22)
+        method_sheet.set_column("B:B", 110)
+    return output.getvalue()
+
+
 def render_employee_upload() -> EmployeeLookup | None:
     employee_file = st.sidebar.file_uploader(
         "1. 人员主数据",
         type=["xlsx", "xls"],
-        help="验收、拣货与打包共用。支持用户编码/Use ID、ERP、姓名和考勤组字段；考勤组为空时结果保持为空。",
+        help="验收、上架、拣货与打包共用。支持用户编码/Use ID、ERP、姓名和考勤组字段；考勤组为空时结果保持为空。",
         key="employee_master",
     )
     if employee_file is None:
@@ -1588,14 +1915,146 @@ def render_packing_module(employee_lookup: EmployeeLookup | None) -> None:
 """
         )
 
+def render_putaway_module(employee_lookup: EmployeeLookup | None) -> None:
+    putaway_files = st.sidebar.file_uploader(
+        "2. 上架结果文件（可多选）",
+        type=["xlsx", "xls"],
+        accept_multiple_files=True,
+        help="可同时上传多个时间段的文件。程序会自动合并，并去除跨文件重复明细。",
+        key="putaway_data",
+    )
+    gap_minutes = st.sidebar.slider(
+        "连续上架最大间隔（分钟）",
+        min_value=1,
+        max_value=60,
+        value=15,
+        step=1,
+        help="相邻两个容器完成时间的间隔不超过该值时，计入有效上架时长。超过该值视为上架中断。",
+        key="putaway_gap_minutes",
+    )
+
+    if not putaway_files:
+        st.info("请上传人员主数据和一个或多个上架结果文件。")
+        return
+    if employee_lookup is None:
+        st.info("请先上传人员主数据。未匹配员工不会参与结果。")
+        return
+
+    try:
+        with st.spinner(f"正在合并 {len(putaway_files)} 个上架文件……"):
+            combined, file_summary = combine_putaway_files(putaway_files)
+        operation_types = sorted(
+            {
+                clean_name(value)
+                for value in combined[PUTAWAY_COLUMNS["operation_type"]]
+                if clean_name(value)
+            }
+        )
+        operation_type = st.sidebar.selectbox(
+            "上架作业类型",
+            ["全部", *operation_types],
+            index=0,
+            key="putaway_operation_type",
+            help="可单独查看采购进货、库内返架、逆向入库等作业。Robot自动上架始终排除。",
+        )
+        with st.spinner("正在计算上架人效……"):
+            result = calculate_putaway_productivity(
+                combined,
+                file_summary,
+                employee_lookup,
+                int(gap_minutes),
+                operation_type,
+            )
+    except Exception as exc:
+        st.error(f"上架数据处理失败：{exc}")
+        return
+
+    row1 = st.columns(4)
+    row1[0].metric("总上架件量", f"{result.total_pieces:,.0f}")
+    row1[1].metric("总上架单量", f"{result.total_pis:,}")
+    row1[2].metric("总上架容器量", f"{result.total_containers:,}")
+    row1[3].metric("上架人数", f"{result.operator_count:,}")
+
+    row2 = st.columns(6)
+    row2[0].metric("总有效上架时长", format_duration(result.total_effective_seconds))
+    row2[1].metric("整体容器件比", f"{result.overall_container_piece_ratio:,.2f}")
+    row2[2].metric("整体PI容器比", f"{result.overall_pi_container_ratio:,.2f}")
+    row2[3].metric("整体小时单量", f"{result.overall_hourly_pis:,.2f}")
+    row2[4].metric("整体小时上架容器量", f"{result.overall_hourly_containers:,.2f}")
+    row2[5].metric("整体小时件效", f"{result.overall_hourly_pieces:,.2f}")
+
+    st.subheader("上架人员排名（按上架容器量）")
+    st.dataframe(
+        result.ranking,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "排名": st.column_config.NumberColumn(format="%d"),
+            "上架件量": st.column_config.NumberColumn(format="%d"),
+            "上架单量": st.column_config.NumberColumn(format="%d"),
+            "上架容器量": st.column_config.NumberColumn(format="%d"),
+            "容器件比": st.column_config.NumberColumn(format="%.2f"),
+            "PI容器比": st.column_config.NumberColumn(format="%.2f"),
+            "人效（小时单量）": st.column_config.NumberColumn(format="%.2f"),
+            "小时上架容器量": st.column_config.NumberColumn(format="%.2f"),
+            "人效（小时件效）": st.column_config.NumberColumn(format="%.2f"),
+        },
+    )
+
+    with st.expander("查看上传文件汇总"):
+        st.dataframe(result.file_summary, use_container_width=True, hide_index=True)
+
+    duplicate_removed = result.uploaded_row_count - result.deduplicated_row_count
+    st.caption(
+        f"当前作业类型：{result.operation_type}；按照实际完成的上架容器量从高到低排名；"
+        f"上传原始记录 {result.uploaded_row_count:,} 行；"
+        f"跨文件重复明细去除 {duplicate_removed:,} 行；"
+        f"Robot自动上架排除 {result.robot_row_count:,} 行；"
+        f"无效记录 {result.invalid_row_count:,} 行；"
+        f"未匹配人员记录 {result.excluded_unmatched_rows:,} 行未呈现；"
+        f"最终有效明细 {result.valid_row_count:,} 行。"
+    )
+
+    st.download_button(
+        "下载上架人效结果 Excel",
+        data=make_putaway_excel(result, int(gap_minutes)),
+        file_name="上架人效排名结果.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+
+    with st.expander("上架计算口径"):
+        st.markdown(
+            f"""
+- 可一次上传多个上架文件；程序先合并，仅删除因文件时间范围重叠而重复出现的明细。
+- **Robot自动上架不参与计算**：储区名称等于 `Robot` 或上架员等于 `TMC_CALL` 的记录全部排除。
+- **作业类型**：可选择全部，或单独查看采购进货、库内返架、逆向入库等类型。
+- **考勤组**：从人员主数据匹配，人员表没有考勤组或该字段为空时显示为空。
+- **上架件量**：上架量合计。
+- **上架单量**：京东入库单号（PI）去重数量；一个PI可以包含多个容器。
+- **上架容器量**：上架容器号去重数量，是上架环节的主要完成量。
+- **容器件比**：上架件量 ÷ 上架容器量。
+- **PI容器比**：上架容器量 ÷ 上架单量。
+- **容器完成时间**：同一容器包含多条商品明细时，使用最晚上架时间作为容器完成时间。
+- **有效上架时长**：按员工、按自然日排列容器完成时间；相邻容器间隔不超过 **{int(gap_minutes)} 分钟**时，该间隔计入有效上架时长；超过阈值的空档不计。
+- **人效（小时单量）**：上架单量 ÷ 有效上架小时，单位为PI/小时，越高越好。
+- **小时上架容器量**：上架容器量 ÷ 有效上架小时，单位为容器/小时，越高越好。
+- **人效（小时件效）**：上架件量 ÷ 有效上架小时，单位为件/小时，越高越好。
+- **排名**：按照实际完成的上架容器量从高到低；容器量相同再参考上架件量和小时上架容器量。
+- 原始数据没有开始上架时间，因此有效上架时长是根据相邻容器完成时间推算的工作时长。
+- 未匹配人员不呈现，也不进入总数。
+"""
+        )
+
+
 def render_app() -> None:
     st.set_page_config(page_title=APP_TITLE, page_icon="📊", layout="wide")
     st.title(APP_TITLE)
-    st.caption("统一人员主数据｜验收、拣货与打包人效分析｜结果可下载为Excel")
+    st.caption("统一人员主数据｜验收、上架、拣货与打包人效分析｜结果可下载为Excel")
 
     with st.sidebar:
         st.header("业务模块")
-        module = st.radio("选择分析环节", ["验收", "拣货", "打包"], horizontal=True)
+        module = st.radio("选择分析环节", ["验收", "上架", "拣货", "打包"], horizontal=True)
         st.divider()
         st.header("数据上传")
 
@@ -1603,6 +2062,8 @@ def render_app() -> None:
 
     if module == "验收":
         render_acceptance_module(employee_lookup)
+    elif module == "上架":
+        render_putaway_module(employee_lookup)
     elif module == "拣货":
         render_picking_module(employee_lookup)
     else:
