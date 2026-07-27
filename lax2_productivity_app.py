@@ -3,27 +3,46 @@ from __future__ import annotations
 import io
 import re
 from dataclasses import dataclass
-from typing import Iterable
+from pathlib import Path
+from typing import Iterable, Sequence
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
+try:
+    import python_calamine  # noqa: F401
+
+    HAS_CALAMINE = True
+except ImportError:
+    HAS_CALAMINE = False
+
 
 APP_TITLE = "LAX2 人效分析工具"
 
+EMPLOYEE_COLUMN_ALIASES = {
+    "user_id": ["用户编码", "Use ID", "UseID", "User ID", "userid", "use id"],
+    "erp": ["ERP", "erp"],
+    "name": ["姓名", "员工姓名", "Name", "Employee Name"],
+}
+
 ACCEPTANCE_COLUMNS = {
-    "order": "京东入库单号",
+    "pi": "京东入库单号",
     "quantity": "验收量",
     "operator": "验收人",
     "start": "开始验收时间",
     "end": "最后验收时间",
 }
 
-EMPLOYEE_COLUMN_ALIASES = {
-    "user_id": ["用户编码", "Use ID", "UseID", "User ID", "userid", "use id"],
-    "erp": ["ERP", "erp"],
-    "name": ["姓名", "员工姓名", "Name", "Employee Name"],
+PICKING_COLUMNS = {
+    "order": "订单号",
+    "task": "任务单号",
+    "area": "所属储区",
+    "quantity": "实际拣货量",
+    "receive": "任务领取时间",
+    "finish": "拣货完成时间",
+    "employee_id": "工号",
+    "email": "邮箱",
 }
 
 
@@ -40,22 +59,44 @@ class EmployeeLookup:
 @dataclass(frozen=True)
 class AcceptanceResult:
     ranking: pd.DataFrame
-    total_quantity: float
-    total_order_count: int
+    total_pieces: float
+    total_orders: int
     total_system_seconds: float
     total_actual_seconds: float
-    overall_pieces_per_order: float
+    overall_piece_ratio: float
     overall_hours_per_order: float
     operator_count: int
-    included_row_count: int
+    valid_row_count: int
     total_row_count: int
+    excluded_unmatched_rows: int
+    invalid_row_count: int
+
+
+@dataclass(frozen=True)
+class PickingResult:
+    ranking: pd.DataFrame
+    file_summary: pd.DataFrame
+    total_pieces: float
+    total_orders: int
+    total_tasks: int
+    total_actual_seconds: float
+    overall_task_piece_ratio: float
+    overall_hourly_orders: float
+    overall_hourly_tasks: float
+    operator_count: int
+    uploaded_row_count: int
+    deduplicated_row_count: int
+    valid_row_count: int
+    r_area_row_count: int
+    missing_time_row_count: int
+    excluded_unmatched_rows: int
 
 
 def normalize_column_label(value: object) -> str:
     return re.sub(r"\s+", "", str(value)).casefold()
 
 
-def find_column(columns: Iterable[object], aliases: list[str]) -> str | None:
+def find_column(columns: Iterable[object], aliases: Sequence[str]) -> str | None:
     normalized_to_original = {
         normalize_column_label(column): str(column) for column in columns
     }
@@ -82,14 +123,22 @@ def clean_name(value: object) -> str:
     return re.sub(r"\s+", " ", str(value)).strip()
 
 
+def clean_identifier(value: object) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    text = str(value).strip()
+    if text.casefold() in {"nan", "none", "nat"}:
+        return ""
+    return text
+
+
 def extract_operator_id(value: object) -> str:
-    """将验收人字段转换为人员主数据可匹配的账号。"""
+    """Convert a system account/email value into the ID used by the employee master."""
     if value is None or pd.isna(value):
         return ""
 
     text = str(value).strip()
     parenthetical_values = re.findall(r"\(([^()]*)\)", text)
-
     if parenthetical_values:
         candidate = next(
             (item for item in reversed(parenthetical_values) if "@" in item),
@@ -102,6 +151,13 @@ def extract_operator_id(value: object) -> str:
     if "@" in candidate:
         candidate = candidate.split("@", 1)[0]
     return candidate.strip()
+
+
+def choose_picking_operator_id(employee_id: object, email: object) -> str:
+    employee = extract_operator_id(employee_id)
+    if employee:
+        return employee
+    return extract_operator_id(email)
 
 
 def _add_lookup_value(
@@ -186,7 +242,10 @@ def build_employee_lookup(employee_df: pd.DataFrame) -> EmployeeLookup:
     )
 
 
-def match_employee(operator_id: str, lookup: EmployeeLookup) -> str:
+def match_employee_name(operator_id: str, lookup: EmployeeLookup | None) -> str:
+    if lookup is None:
+        return ""
+
     exact = canonical_key(operator_id)
     compact = compact_key(operator_id)
 
@@ -208,237 +267,197 @@ def format_duration(total_seconds: float) -> str:
     return f"{hours}:{minutes:02d}:{seconds:02d}"
 
 
-def merge_overlapping_seconds(group: pd.DataFrame) -> float:
-    """按人员、按自然日去重重叠时间；不同日期分别计算。"""
-    daily_intervals: dict[object, list[tuple[pd.Timestamp, pd.Timestamp]]] = {}
+def split_interval_by_day(start: pd.Timestamp, end: pd.Timestamp) -> list[tuple[object, pd.Timestamp, pd.Timestamp]]:
+    """Split an interval at midnight so overlap removal is performed separately by day."""
+    if pd.isna(start) or pd.isna(end) or end < start:
+        return []
 
-    for start, end in group[["开始时间", "结束时间"]].itertuples(
-        index=False, name=None
-    ):
-        # 跨午夜的记录拆分到各自自然日，确保只在同一天内去重。
-        segment_start = start
-        while segment_start.normalize() < end.normalize():
-            next_midnight = segment_start.normalize() + pd.Timedelta(days=1)
-            daily_intervals.setdefault(segment_start.date(), []).append(
-                (segment_start, next_midnight)
-            )
-            segment_start = next_midnight
+    pieces: list[tuple[object, pd.Timestamp, pd.Timestamp]] = []
+    cursor = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end)
 
-        if end > segment_start:
-            daily_intervals.setdefault(segment_start.date(), []).append(
-                (segment_start, end)
-            )
+    while cursor.date() < end_ts.date():
+        midnight = cursor.normalize() + pd.Timedelta(days=1)
+        pieces.append((cursor.date(), cursor, midnight))
+        cursor = midnight
 
-    total_seconds = 0.0
-
-    for intervals in daily_intervals.values():
-        intervals.sort(key=lambda item: (item[0], item[1]))
-        current_start: pd.Timestamp | None = None
-        current_end: pd.Timestamp | None = None
-
-        for start, end in intervals:
-            if current_start is None:
-                current_start, current_end = start, end
-                continue
-
-            # 仅合并同一自然日内重叠或首尾相接的区间。
-            if start <= current_end:
-                if end > current_end:
-                    current_end = end
-            else:
-                total_seconds += (current_end - current_start).total_seconds()
-                current_start, current_end = start, end
-
-        if current_start is not None and current_end is not None:
-            total_seconds += (current_end - current_start).total_seconds()
-
-    return float(total_seconds)
+    pieces.append((cursor.date(), cursor, end_ts))
+    return pieces
 
 
-def count_unique_orders(series: pd.Series) -> int:
-    cleaned = series.fillna("").astype(str).str.strip()
-    return int(cleaned[cleaned.ne("")].nunique())
-
-
-def merge_interval_list_seconds(
-    intervals: list[tuple[pd.Timestamp, pd.Timestamp]],
-) -> float:
-    """合并一组已经位于同一自然日内的时间区间。"""
-    if not intervals:
-        return 0.0
-
-    ordered = sorted(intervals, key=lambda item: (item[0], item[1]))
-    current_start, current_end = ordered[0]
-    total_seconds = 0.0
-
-    for start, end in ordered[1:]:
-        if start <= current_end:
-            if end > current_end:
-                current_end = end
-        else:
-            total_seconds += (current_end - current_start).total_seconds()
-            current_start, current_end = start, end
-
-    total_seconds += (current_end - current_start).total_seconds()
-    return float(total_seconds)
-
-
-def calculate_actual_acceptance_seconds(group: pd.DataFrame) -> float:
-    """
-    计算实际验收时长：
-    1. 同一验收人、同一自然日、同一京东入库单号（PI），取最早开始至最晚结束；
-    2. 同一天内，不同 PI 形成的时间区间如有重叠，重叠部分只计算一次；
-    3. 不同日期分别计算后再相加。
-    """
-    daily_pi_segments: list[dict[str, object]] = []
-
-    for order_no, start, end in group[
-        ["京东入库单号清洗", "开始时间", "结束时间"]
-    ].itertuples(index=False, name=None):
-        if not order_no or end <= start:
-            continue
-
-        segment_start = start
-        while segment_start.normalize() < end.normalize():
-            next_midnight = segment_start.normalize() + pd.Timedelta(days=1)
-            daily_pi_segments.append(
-                {
-                    "日期": segment_start.date(),
-                    "京东入库单号": order_no,
-                    "开始": segment_start,
-                    "结束": next_midnight,
-                }
-            )
-            segment_start = next_midnight
-
-        if end > segment_start:
-            daily_pi_segments.append(
-                {
-                    "日期": segment_start.date(),
-                    "京东入库单号": order_no,
-                    "开始": segment_start,
-                    "结束": end,
-                }
-            )
-
-    if not daily_pi_segments:
-        return 0.0
-
-    segments = pd.DataFrame(daily_pi_segments)
-    pi_intervals = (
-        segments.groupby(["日期", "京东入库单号"], as_index=False)
-        .agg(开始=("开始", "min"), 结束=("结束", "max"))
+def merge_interval_seconds(intervals: Iterable[tuple[pd.Timestamp, pd.Timestamp]]) -> float:
+    cleaned = sorted(
+        [(pd.Timestamp(start), pd.Timestamp(end)) for start, end in intervals if end >= start],
+        key=lambda item: item[0],
     )
+    if not cleaned:
+        return 0.0
 
-    total_seconds = 0.0
-    for _, daily in pi_intervals.groupby("日期", sort=False):
-        intervals = list(
-            daily[["开始", "结束"]].itertuples(index=False, name=None)
+    current_start, current_end = cleaned[0]
+    total = 0.0
+    for next_start, next_end in cleaned[1:]:
+        if next_start <= current_end:
+            current_end = max(current_end, next_end)
+        else:
+            total += (current_end - current_start).total_seconds()
+            current_start, current_end = next_start, next_end
+    total += (current_end - current_start).total_seconds()
+    return max(total, 0.0)
+
+
+def calculate_daily_merged_seconds(
+    interval_df: pd.DataFrame,
+    operator_col: str,
+    start_col: str,
+    end_col: str,
+) -> pd.DataFrame:
+    records: list[dict[str, object]] = []
+    for row in interval_df[[operator_col, start_col, end_col]].itertuples(index=False, name=None):
+        operator_id, start, end = row
+        for work_date, part_start, part_end in split_interval_by_day(start, end):
+            records.append(
+                {
+                    "账号": operator_id,
+                    "工作日期": work_date,
+                    "开始": part_start,
+                    "结束": part_end,
+                }
+            )
+
+    if not records:
+        return pd.DataFrame(columns=["账号", "秒数"])
+
+    split_df = pd.DataFrame(records)
+    daily_records: list[dict[str, object]] = []
+    for (operator_id, work_date), group in split_df.groupby(["账号", "工作日期"], sort=False):
+        daily_records.append(
+            {
+                "账号": operator_id,
+                "工作日期": work_date,
+                "秒数": merge_interval_seconds(zip(group["开始"], group["结束"])),
+            }
         )
-        total_seconds += merge_interval_list_seconds(intervals)
 
-    return float(total_seconds)
+    daily = pd.DataFrame(daily_records)
+    return daily.groupby("账号", as_index=False)["秒数"].sum()
+
+
+@st.cache_data(show_spinner=False)
+def get_sheet_names(file_bytes: bytes, file_name: str) -> list[str]:
+    engine = "calamine" if HAS_CALAMINE else (
+        "xlrd" if Path(file_name).suffix.lower() == ".xls" else "openpyxl"
+    )
+    with pd.ExcelFile(io.BytesIO(file_bytes), engine=engine) as workbook:
+        return workbook.sheet_names
+
+
+@st.cache_data(show_spinner=False)
+def read_excel_sheet(
+    file_bytes: bytes,
+    file_name: str,
+    sheet_name: str | int,
+    usecols: tuple[str, ...] | None = None,
+) -> pd.DataFrame:
+    engine = "calamine" if HAS_CALAMINE else (
+        "xlrd" if Path(file_name).suffix.lower() == ".xls" else "openpyxl"
+    )
+    selected_columns = list(usecols) if usecols else None
+    return pd.read_excel(
+        io.BytesIO(file_bytes),
+        sheet_name=sheet_name,
+        usecols=selected_columns,
+        engine=engine,
+    )
 
 
 def calculate_acceptance_productivity(
     acceptance_df: pd.DataFrame,
-    employee_lookup: EmployeeLookup,
+    employee_lookup: EmployeeLookup | None,
 ) -> AcceptanceResult:
-    missing_columns = [
-        column for column in ACCEPTANCE_COLUMNS.values() if column not in acceptance_df.columns
-    ]
-    if missing_columns:
-        raise ValueError("验收表缺少必要字段：" + "、".join(missing_columns))
+    required = list(ACCEPTANCE_COLUMNS.values())
+    missing = [column for column in required if column not in acceptance_df.columns]
+    if missing:
+        raise ValueError("验收表缺少必要字段：" + "、".join(missing))
 
-    work = acceptance_df[list(ACCEPTANCE_COLUMNS.values())].copy()
+    work = acceptance_df[required].copy()
+    total_row_count = len(work)
     work["验收人账号"] = work[ACCEPTANCE_COLUMNS["operator"]].map(extract_operator_id)
     work["实际姓名"] = work["验收人账号"].map(
-        lambda value: match_employee(value, employee_lookup)
+        lambda value: match_employee_name(value, employee_lookup)
     )
-    work["京东入库单号清洗"] = (
-        work[ACCEPTANCE_COLUMNS["order"]].fillna("").astype(str).str.strip()
-    )
-    work["验收量数值"] = pd.to_numeric(
+    work["PI"] = work[ACCEPTANCE_COLUMNS["pi"]].map(clean_identifier)
+    work["验收件量数值"] = pd.to_numeric(
         work[ACCEPTANCE_COLUMNS["quantity"]], errors="coerce"
     )
-    work["开始时间"] = pd.to_datetime(
-        work[ACCEPTANCE_COLUMNS["start"]], errors="coerce"
-    )
-    work["结束时间"] = pd.to_datetime(
-        work[ACCEPTANCE_COLUMNS["end"]], errors="coerce"
-    )
+    work["开始时间"] = pd.to_datetime(work[ACCEPTANCE_COLUMNS["start"]], errors="coerce")
+    work["结束时间"] = pd.to_datetime(work[ACCEPTANCE_COLUMNS["end"]], errors="coerce")
 
-    valid_mask = (
+    basic_valid = (
         work["验收人账号"].ne("")
-        & work["实际姓名"].ne("")
-        & work["验收量数值"].notna()
+        & work["PI"].ne("")
+        & work["验收件量数值"].notna()
         & work["开始时间"].notna()
         & work["结束时间"].notna()
         & (work["结束时间"] >= work["开始时间"])
     )
-    valid = work.loc[valid_mask].copy()
+    invalid_row_count = int((~basic_valid).sum())
+    work = work.loc[basic_valid].copy()
 
+    excluded_unmatched_rows = int(work["实际姓名"].eq("").sum())
+    valid = work.loc[work["实际姓名"].ne("")].copy()
     if valid.empty:
-        raise ValueError("没有可用于计算的人效记录，请检查人员表、验收量和时间字段。")
+        raise ValueError("没有匹配到人员主数据的有效验收记录。")
 
-    ranking_rows: list[dict[str, object]] = []
-    for (operator_id, employee_name), group in valid.groupby(
-        ["验收人账号", "实际姓名"], sort=False
-    ):
-        ranking_rows.append(
-            {
-                "验收人账号": operator_id,
-                "实际姓名": employee_name,
-                "验收件量": float(group["验收量数值"].sum()),
-                "验收单量": count_unique_orders(group["京东入库单号清洗"]),
-                "系统操作秒数": merge_overlapping_seconds(group),
-                "实际验收秒数": calculate_actual_acceptance_seconds(group),
-            }
+    # System-operation duration: merge all raw operation intervals by employee and day.
+    system_duration = calculate_daily_merged_seconds(
+        valid, "验收人账号", "开始时间", "结束时间"
+    ).rename(columns={"账号": "验收人账号", "秒数": "系统操作秒数"})
+
+    # Actual acceptance duration: create one interval for each employee + day + PI,
+    # then remove overlaps among PI intervals within the same day.
+    valid["PI日期"] = valid["开始时间"].dt.date
+    pi_intervals = (
+        valid.groupby(["验收人账号", "PI日期", "PI"], as_index=False)
+        .agg(PI开始时间=("开始时间", "min"), PI结束时间=("结束时间", "max"))
+    )
+    actual_duration = calculate_daily_merged_seconds(
+        pi_intervals, "验收人账号", "PI开始时间", "PI结束时间"
+    ).rename(columns={"账号": "验收人账号", "秒数": "实际验收秒数"})
+
+    summary = (
+        valid.groupby(["验收人账号", "实际姓名"], as_index=False)
+        .agg(
+            验收件量=("验收件量数值", "sum"),
+            验收单量=("PI", "nunique"),
         )
+    )
+    summary = summary.merge(system_duration, on="验收人账号", how="left")
+    summary = summary.merge(actual_duration, on="验收人账号", how="left")
+    summary[["系统操作秒数", "实际验收秒数"]] = summary[
+        ["系统操作秒数", "实际验收秒数"]
+    ].fillna(0.0)
 
-    ranking = pd.DataFrame(ranking_rows)
-    ranking["系统操作小时"] = ranking["系统操作秒数"] / 3600
-    ranking["实际验收小时"] = ranking["实际验收秒数"] / 3600
-    ranking["单件比"] = np.where(
-        ranking["验收单量"] > 0,
-        ranking["验收件量"] / ranking["验收单量"],
+    summary["单件比"] = np.where(
+        summary["验收单量"] > 0,
+        summary["验收件量"] / summary["验收单量"],
         np.nan,
     )
-    # 按用户指定公式：实际验收时长 ÷ 验收单量，单位为小时/单。
-    ranking["人效（小时单量）"] = np.where(
-        ranking["验收单量"] > 0,
-        ranking["实际验收小时"] / ranking["验收单量"],
+    summary["人效（小时单量）"] = np.where(
+        summary["验收单量"] > 0,
+        (summary["实际验收秒数"] / 3600) / summary["验收单量"],
         np.nan,
     )
+    summary["系统操作时长"] = summary["系统操作秒数"].map(format_duration)
+    summary["实际验收时长"] = summary["实际验收秒数"].map(format_duration)
 
-    # 人效（小时单量）越低，表示平均每单耗时越短；单件比作为订单结构参考。
-    ranking = ranking.sort_values(
+    summary = summary.sort_values(
         ["人效（小时单量）", "验收件量"],
         ascending=[True, False],
         na_position="last",
     ).reset_index(drop=True)
-    ranking.insert(0, "排名", np.arange(1, len(ranking) + 1))
-    ranking["系统操作时长"] = ranking["系统操作秒数"].map(format_duration)
-    ranking["实际验收时长"] = ranking["实际验收秒数"].map(format_duration)
+    summary.insert(0, "排名", np.arange(1, len(summary) + 1))
 
-    total_quantity = float(ranking["验收件量"].sum())
-    total_order_count = count_unique_orders(valid["京东入库单号清洗"])
-    total_system_seconds = float(ranking["系统操作秒数"].sum())
-    total_actual_seconds = float(ranking["实际验收秒数"].sum())
-    total_actual_hours = total_actual_seconds / 3600
-
-    overall_pieces_per_order = (
-        total_quantity / total_order_count
-        if total_order_count > 0
-        else float("nan")
-    )
-    overall_hours_per_order = (
-        total_actual_hours / total_order_count
-        if total_order_count > 0
-        else float("nan")
-    )
-
-    ranking_display = ranking[
+    ranking = summary[
         [
             "排名",
             "验收人账号",
@@ -452,45 +471,232 @@ def calculate_acceptance_productivity(
         ]
     ].copy()
 
+    total_pieces = float(valid["验收件量数值"].sum())
+    total_orders = int(valid["PI"].nunique())
+    total_system_seconds = float(summary["系统操作秒数"].sum())
+    total_actual_seconds = float(summary["实际验收秒数"].sum())
+    overall_piece_ratio = total_pieces / total_orders if total_orders else float("nan")
+    overall_hours_per_order = (
+        (total_actual_seconds / 3600) / total_orders if total_orders else float("nan")
+    )
+
     return AcceptanceResult(
-        ranking=ranking_display,
-        total_quantity=total_quantity,
-        total_order_count=total_order_count,
+        ranking=ranking,
+        total_pieces=total_pieces,
+        total_orders=total_orders,
         total_system_seconds=total_system_seconds,
         total_actual_seconds=total_actual_seconds,
-        overall_pieces_per_order=overall_pieces_per_order,
+        overall_piece_ratio=overall_piece_ratio,
         overall_hours_per_order=overall_hours_per_order,
-        operator_count=len(ranking_display),
-        included_row_count=len(valid),
-        total_row_count=len(work),
+        operator_count=len(summary),
+        valid_row_count=len(valid),
+        total_row_count=total_row_count,
+        excluded_unmatched_rows=excluded_unmatched_rows,
+        invalid_row_count=invalid_row_count,
     )
 
 
-@st.cache_data(show_spinner=False)
-def get_sheet_names(file_bytes: bytes) -> list[str]:
-    with pd.ExcelFile(io.BytesIO(file_bytes)) as workbook:
-        return workbook.sheet_names
+def combine_picking_files(uploaded_files: Sequence[object]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    frames: list[pd.DataFrame] = []
+    summary_rows: list[dict[str, object]] = []
+    required = tuple(PICKING_COLUMNS.values())
+
+    for uploaded in uploaded_files:
+        file_bytes = uploaded.getvalue()
+        file_name = uploaded.name
+        try:
+            frame = read_excel_sheet(file_bytes, file_name, 0, required)
+        except ValueError as exc:
+            raise ValueError(f"文件“{file_name}”缺少必要字段或读取失败：{exc}") from exc
+
+        original_rows = len(frame)
+        frame["来源文件"] = file_name
+        frames.append(frame)
+        summary_rows.append({"文件名": file_name, "读取行数": original_rows})
+
+    if not frames:
+        raise ValueError("请至少上传一个拣货文件。")
+
+    combined = pd.concat(frames, ignore_index=True)
+    file_summary = pd.DataFrame(summary_rows)
+    return combined, file_summary
 
 
-@st.cache_data(show_spinner=False)
-def read_excel_sheet(
-    file_bytes: bytes,
-    sheet_name: str,
-    usecols: tuple[str, ...] | None = None,
-) -> pd.DataFrame:
-    selected_columns = list(usecols) if usecols else None
-    return pd.read_excel(
-        io.BytesIO(file_bytes),
-        sheet_name=sheet_name,
-        usecols=selected_columns,
+def calculate_picking_productivity(
+    combined_df: pd.DataFrame,
+    file_summary: pd.DataFrame,
+    employee_lookup: EmployeeLookup | None,
+) -> PickingResult:
+    required = list(PICKING_COLUMNS.values())
+    missing = [column for column in required if column not in combined_df.columns]
+    if missing:
+        raise ValueError("拣货表缺少必要字段：" + "、".join(missing))
+
+    uploaded_row_count = len(combined_df)
+
+    # Remove exact duplicates across weekly files. Source file is excluded from the key.
+    work = combined_df.drop_duplicates(subset=required, keep="first").copy()
+    deduplicated_row_count = len(work)
+
+    work["所属储区标准值"] = (
+        work[PICKING_COLUMNS["area"]].fillna("").astype(str).str.strip().str.upper()
+    )
+    r_area_mask = work["所属储区标准值"].eq("R")
+    r_area_row_count = int(r_area_mask.sum())
+    work = work.loc[~r_area_mask].copy()
+
+    work["拣货人账号"] = [
+        choose_picking_operator_id(employee_id, email)
+        for employee_id, email in zip(
+            work[PICKING_COLUMNS["employee_id"]],
+            work[PICKING_COLUMNS["email"]],
+        )
+    ]
+    work["实际姓名"] = work["拣货人账号"].map(
+        lambda value: match_employee_name(value, employee_lookup)
+    )
+    work["订单号标准值"] = work[PICKING_COLUMNS["order"]].map(clean_identifier)
+    work["任务单号标准值"] = work[PICKING_COLUMNS["task"]].map(clean_identifier)
+    work["拣货件量数值"] = pd.to_numeric(
+        work[PICKING_COLUMNS["quantity"]], errors="coerce"
+    )
+    work["领取时间"] = pd.to_datetime(
+        work[PICKING_COLUMNS["receive"]], errors="coerce"
+    )
+    work["完成时间"] = pd.to_datetime(
+        work[PICKING_COLUMNS["finish"]], errors="coerce"
+    )
+
+    has_time = work["领取时间"].notna() & work["完成时间"].notna()
+    missing_time_row_count = int((~has_time).sum())
+
+    valid_mask = (
+        work["拣货人账号"].ne("")
+        & work["订单号标准值"].ne("")
+        & work["任务单号标准值"].ne("")
+        & work["拣货件量数值"].notna()
+        & has_time
+        & (work["完成时间"] >= work["领取时间"])
+    )
+    work = work.loc[valid_mask].copy()
+
+    excluded_unmatched_rows = int(work["实际姓名"].eq("").sum())
+    valid = work.loc[work["实际姓名"].ne("")].copy()
+    if valid.empty:
+        raise ValueError("排除R区、无领取时间和未匹配人员后，没有可计算的拣货记录。")
+
+    # Build one complete interval per employee + day + picking task.
+    valid["任务日期"] = valid["领取时间"].dt.date
+    task_intervals = (
+        valid.groupby(["拣货人账号", "任务日期", "任务单号标准值"], as_index=False)
+        .agg(
+            任务开始时间=("领取时间", "min"),
+            任务结束时间=("完成时间", "max"),
+        )
+    )
+    actual_duration = calculate_daily_merged_seconds(
+        task_intervals, "拣货人账号", "任务开始时间", "任务结束时间"
+    ).rename(columns={"账号": "拣货人账号", "秒数": "实际拣货秒数"})
+
+    summary = (
+        valid.groupby(["拣货人账号", "实际姓名"], as_index=False)
+        .agg(
+            拣货件量=("拣货件量数值", "sum"),
+            订单量=("订单号标准值", "nunique"),
+            任务单量=("任务单号标准值", "nunique"),
+        )
+    )
+    summary = summary.merge(actual_duration, on="拣货人账号", how="left")
+    summary["实际拣货秒数"] = summary["实际拣货秒数"].fillna(0.0)
+    summary["实际拣货小时"] = summary["实际拣货秒数"] / 3600
+    summary["任务件比"] = np.where(
+        summary["任务单量"] > 0,
+        summary["拣货件量"] / summary["任务单量"],
+        np.nan,
+    )
+    summary["人效（小时单量）"] = np.where(
+        summary["实际拣货小时"] > 0,
+        summary["订单量"] / summary["实际拣货小时"],
+        np.nan,
+    )
+    summary["小时任务单量"] = np.where(
+        summary["实际拣货小时"] > 0,
+        summary["任务单量"] / summary["实际拣货小时"],
+        np.nan,
+    )
+    summary["实际拣货时长"] = summary["实际拣货秒数"].map(format_duration)
+
+    summary = summary.sort_values(
+        ["人效（小时单量）", "小时任务单量", "拣货件量"],
+        ascending=[False, False, False],
+        na_position="last",
+    ).reset_index(drop=True)
+    summary.insert(0, "排名", np.arange(1, len(summary) + 1))
+
+    ranking = summary[
+        [
+            "排名",
+            "拣货人账号",
+            "实际姓名",
+            "拣货件量",
+            "订单量",
+            "任务单量",
+            "任务件比",
+            "实际拣货时长",
+            "人效（小时单量）",
+            "小时任务单量",
+        ]
+    ].copy()
+
+    total_pieces = float(valid["拣货件量数值"].sum())
+    total_orders = int(valid["订单号标准值"].nunique())
+    total_tasks = int(valid["任务单号标准值"].nunique())
+    total_actual_seconds = float(summary["实际拣货秒数"].sum())
+    total_hours = total_actual_seconds / 3600
+
+    return PickingResult(
+        ranking=ranking,
+        file_summary=file_summary,
+        total_pieces=total_pieces,
+        total_orders=total_orders,
+        total_tasks=total_tasks,
+        total_actual_seconds=total_actual_seconds,
+        overall_task_piece_ratio=(total_pieces / total_tasks if total_tasks else float("nan")),
+        overall_hourly_orders=(total_orders / total_hours if total_hours else float("nan")),
+        overall_hourly_tasks=(total_tasks / total_hours if total_hours else float("nan")),
+        operator_count=len(summary),
+        uploaded_row_count=uploaded_row_count,
+        deduplicated_row_count=deduplicated_row_count,
+        valid_row_count=len(valid),
+        r_area_row_count=r_area_row_count,
+        missing_time_row_count=missing_time_row_count,
+        excluded_unmatched_rows=excluded_unmatched_rows,
     )
 
 
-def make_excel_output(result: AcceptanceResult) -> bytes:
+def _excel_formats(workbook):
+    return {
+        "header": workbook.add_format(
+            {
+                "bold": True,
+                "font_color": "#FFFFFF",
+                "bg_color": "#1F4E78",
+                "border": 1,
+                "align": "center",
+                "valign": "vcenter",
+            }
+        ),
+        "integer": workbook.add_format({"num_format": "#,##0"}),
+        "decimal": workbook.add_format({"num_format": "#,##0.00"}),
+        "decimal4": workbook.add_format({"num_format": "0.0000"}),
+        "text": workbook.add_format({"valign": "vcenter"}),
+    }
+
+
+def make_acceptance_excel(result: AcceptanceResult) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         result.ranking.to_excel(writer, sheet_name="验收人效排名", index=False)
-
         method = pd.DataFrame(
             {
                 "项目": [
@@ -500,142 +706,171 @@ def make_excel_output(result: AcceptanceResult) -> bytes:
                     "系统操作时长",
                     "实际验收时长",
                     "人效（小时单量）",
-                    "人员匹配",
-                    "总验收单量",
-                    "整体系统操作时长",
-                    "整体实际验收时长",
+                    "人员范围",
                 ],
                 "计算口径": [
-                    "按验收人汇总计入计算记录中的验收件量",
-                    "按验收人对京东入库单号去重计数；同一人员重复出现的同一单号只计1单",
-                    "验收件量 ÷ 验收单量，表示平均每张PI包含多少件",
-                    "按验收人、按自然日合并每条系统操作记录的开始至结束时间区间；同一天内重叠时间只计算一次",
-                    "同一验收人、同一自然日、同一京东入库单号（PI）取最早开始至最晚结束；再将当天各PI区间去重后相加",
-                    "实际验收小时 ÷ 验收单量，单位为小时/单；数值越低表示平均每单耗时越短",
-                    "先匹配用户编码/Use ID，再匹配ERP；账号中的@域名自动移除；未匹配人员不呈现且不计入结果",
-                    "所有已匹配记录中的京东入库单号全局去重计数",
-                    "所有已匹配验收人的系统操作时长相加",
-                    "所有已匹配验收人的实际验收时长相加",
+                    "按人员汇总验收量",
+                    "京东入库单号去重数量",
+                    "验收件量 ÷ 验收单量",
+                    "原始系统操作区间按人员、按自然日去除重叠后相加",
+                    "单个PI取最早开始至最晚结束；同一人员同一天的PI区间去除重叠后相加",
+                    "实际验收小时 ÷ 验收单量（小时/单，越低表示平均每单用时越短）",
+                    "仅保留成功匹配人员主数据的员工",
                 ],
             }
         )
         method.to_excel(writer, sheet_name="计算口径", index=False)
 
         workbook = writer.book
-        header_format = workbook.add_format(
-            {
-                "bold": True,
-                "font_color": "#FFFFFF",
-                "bg_color": "#1F4E78",
-                "border": 1,
-                "align": "center",
-                "valign": "vcenter",
-            }
-        )
-        integer_format = workbook.add_format({"num_format": "#,##0"})
-        decimal_format = workbook.add_format({"num_format": "#,##0.00"})
-        text_format = workbook.add_format({"valign": "vcenter"})
-
-        ranking_sheet = writer.sheets["验收人效排名"]
-        ranking_sheet.freeze_panes(1, 0)
-        ranking_sheet.autofilter(
-            0, 0, len(result.ranking), len(result.ranking.columns) - 1
-        )
-        ranking_sheet.set_row(0, 24, header_format)
-        ranking_sheet.set_column("A:A", 8, integer_format)
-        ranking_sheet.set_column("B:B", 24, text_format)
-        ranking_sheet.set_column("C:C", 22, text_format)
-        ranking_sheet.set_column("D:E", 14, integer_format)
-        ranking_sheet.set_column("F:F", 14, decimal_format)
-        ranking_sheet.set_column("G:H", 20, text_format)
-        ranking_sheet.set_column("I:I", 18, decimal_format)
+        fmt = _excel_formats(workbook)
+        sheet = writer.sheets["验收人效排名"]
+        sheet.freeze_panes(1, 0)
+        sheet.autofilter(0, 0, len(result.ranking), len(result.ranking.columns) - 1)
+        sheet.set_row(0, 24, fmt["header"])
+        widths = [8, 22, 22, 14, 14, 12, 18, 18, 18]
+        for col_idx, width in enumerate(widths):
+            sheet.set_column(col_idx, col_idx, width)
+        sheet.set_column(0, 0, 8, fmt["integer"])
+        sheet.set_column(3, 4, 14, fmt["integer"])
+        sheet.set_column(5, 5, 12, fmt["decimal"])
+        sheet.set_column(8, 8, 18, fmt["decimal4"])
 
         method_sheet = writer.sheets["计算口径"]
-        method_sheet.set_row(0, 24, header_format)
-        method_sheet.set_column("A:A", 24)
+        method_sheet.set_row(0, 24, fmt["header"])
+        method_sheet.set_column("A:A", 22)
         method_sheet.set_column("B:B", 100)
-        method_sheet.set_default_row(30)
-
     return output.getvalue()
 
 
-def render_app() -> None:
-    st.set_page_config(page_title=APP_TITLE, page_icon="📊", layout="wide")
-    st.title(APP_TITLE)
-    st.caption("第一阶段：验收人效｜人员主数据可复用于后续所有业务模块")
-
-    with st.sidebar:
-        st.header("数据上传")
-        employee_file = st.file_uploader(
-            "1. 人员主数据",
-            type=["xlsx", "xls"],
-            help="用于将系统账号匹配为实际姓名。支持用户编码/Use ID、ERP和姓名字段。",
-            key="employee_master",
+def make_picking_excel(result: PickingResult) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        result.ranking.to_excel(writer, sheet_name="拣货人效排名", index=False)
+        result.file_summary.to_excel(writer, sheet_name="上传文件汇总", index=False)
+        method = pd.DataFrame(
+            {
+                "项目": [
+                    "R区",
+                    "多文件合并",
+                    "拣货件量",
+                    "订单量",
+                    "任务单量",
+                    "任务件比",
+                    "实际拣货时长",
+                    "人效（小时单量）",
+                    "小时任务单量",
+                    "人员范围",
+                ],
+                "计算口径": [
+                    "所属储区等于R的记录全部排除，本阶段不参与计算",
+                    "允许同时上传多个周文件；完全重复的明细仅保留一条",
+                    "实际拣货量合计",
+                    "订单号去重数量",
+                    "任务单号去重数量",
+                    "拣货件量 ÷ 任务单量",
+                    "每个任务取任务领取时间至最晚拣货完成时间；同一人员同一天的任务区间去除重叠后相加",
+                    "订单量 ÷ 实际拣货小时（订单/小时，越高越好）",
+                    "任务单量 ÷ 实际拣货小时（任务/小时，越高越好）",
+                    "仅保留有任务领取时间且成功匹配人员主数据的员工",
+                ],
+            }
         )
-        acceptance_file = st.file_uploader(
-            "2. 验收明细表",
-            type=["xlsx", "xls"],
-            key="acceptance_data",
-        )
+        method.to_excel(writer, sheet_name="计算口径", index=False)
 
-        st.divider()
-        st.markdown("**后续模块**")
-        st.caption("上架、复核、打包、大波次拣货、普通拣货将继续使用同一张人员主数据匹配姓名。")
+        workbook = writer.book
+        fmt = _excel_formats(workbook)
+        sheet = writer.sheets["拣货人效排名"]
+        sheet.freeze_panes(1, 0)
+        sheet.autofilter(0, 0, len(result.ranking), len(result.ranking.columns) - 1)
+        sheet.set_row(0, 24, fmt["header"])
+        widths = [8, 22, 22, 14, 12, 12, 12, 18, 18, 16]
+        for col_idx, width in enumerate(widths):
+            sheet.set_column(col_idx, col_idx, width)
+        sheet.set_column(0, 0, 8, fmt["integer"])
+        sheet.set_column(3, 5, 14, fmt["integer"])
+        sheet.set_column(6, 6, 12, fmt["decimal"])
+        sheet.set_column(8, 9, 18, fmt["decimal"])
 
-    if employee_file is None or acceptance_file is None:
+        file_sheet = writer.sheets["上传文件汇总"]
+        file_sheet.set_row(0, 24, fmt["header"])
+        file_sheet.set_column("A:A", 45)
+        file_sheet.set_column("B:B", 14, fmt["integer"])
+
+        method_sheet = writer.sheets["计算口径"]
+        method_sheet.set_row(0, 24, fmt["header"])
+        method_sheet.set_column("A:A", 22)
+        method_sheet.set_column("B:B", 105)
+    return output.getvalue()
+
+
+def render_employee_upload() -> EmployeeLookup | None:
+    employee_file = st.sidebar.file_uploader(
+        "1. 人员主数据",
+        type=["xlsx", "xls"],
+        help="验收与拣货共用。支持用户编码/Use ID、ERP和姓名字段。",
+        key="employee_master",
+    )
+    if employee_file is None:
+        return None
+
+    try:
+        file_bytes = employee_file.getvalue()
+        sheets = get_sheet_names(file_bytes, employee_file.name)
+        sheet_name = st.sidebar.selectbox("人员表工作表", sheets, key="employee_sheet")
+        employee_df = read_excel_sheet(file_bytes, employee_file.name, sheet_name)
+        lookup = build_employee_lookup(employee_df)
+        st.sidebar.success(f"人员主数据已读取：{lookup.source_rows:,} 行")
+        if lookup.duplicate_keys:
+            st.sidebar.warning(
+                f"发现 {len(lookup.duplicate_keys)} 个重复匹配键，保留首次出现的姓名。"
+            )
+        return lookup
+    except Exception as exc:
+        st.sidebar.error(f"人员表读取失败：{exc}")
+        return None
+
+
+def render_acceptance_module(employee_lookup: EmployeeLookup | None) -> None:
+    acceptance_file = st.sidebar.file_uploader(
+        "2. 验收明细表",
+        type=["xlsx", "xls"],
+        key="acceptance_data",
+    )
+    if acceptance_file is None:
         st.info("请上传人员主数据和验收明细表。")
+        return
+    if employee_lookup is None:
+        st.info("请先上传人员主数据。未匹配员工不会参与结果。")
         return
 
     try:
-        employee_bytes = employee_file.getvalue()
-        employee_sheets = get_sheet_names(employee_bytes)
-        employee_sheet = st.sidebar.selectbox(
-            "人员表工作表",
-            employee_sheets,
-            key="employee_sheet",
-        )
-        employee_df = read_excel_sheet(employee_bytes, employee_sheet)
-        employee_lookup = build_employee_lookup(employee_df)
-        st.sidebar.success(f"人员源数据已读取：{employee_lookup.source_rows:,} 行")
-        if employee_lookup.duplicate_keys:
-            st.sidebar.warning(
-                f"发现 {len(employee_lookup.duplicate_keys)} 个重复匹配键，程序保留首次出现的姓名。"
-            )
-
-        acceptance_bytes = acceptance_file.getvalue()
-        acceptance_sheets = get_sheet_names(acceptance_bytes)
-        acceptance_sheet = st.sidebar.selectbox(
-            "验收表工作表",
-            acceptance_sheets,
-            key="acceptance_sheet",
-        )
-
+        file_bytes = acceptance_file.getvalue()
+        sheets = get_sheet_names(file_bytes, acceptance_file.name)
+        sheet_name = st.sidebar.selectbox("验收表工作表", sheets, key="acceptance_sheet")
         with st.spinner("正在读取并计算验收人效……"):
-            acceptance_df = read_excel_sheet(
-                acceptance_bytes,
-                acceptance_sheet,
+            df = read_excel_sheet(
+                file_bytes,
+                acceptance_file.name,
+                sheet_name,
                 tuple(ACCEPTANCE_COLUMNS.values()),
             )
-            result = calculate_acceptance_productivity(
-                acceptance_df=acceptance_df,
-                employee_lookup=employee_lookup,
-            )
+            result = calculate_acceptance_productivity(df, employee_lookup)
     except Exception as exc:
-        st.error(f"处理失败：{exc}")
+        st.error(f"验收数据处理失败：{exc}")
         return
 
-    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-    kpi1.metric("总验收件量", f"{result.total_quantity:,.0f}")
-    kpi2.metric("总验收单量", f"{result.total_order_count:,}")
-    kpi3.metric("整体单件比", f"{result.overall_pieces_per_order:,.2f}")
-    kpi4.metric("验收人数", f"{result.operator_count:,}")
+    row1 = st.columns(4)
+    row1[0].metric("总验收件量", f"{result.total_pieces:,.0f}")
+    row1[1].metric("总验收单量", f"{result.total_orders:,}")
+    row1[2].metric("整体单件比", f"{result.overall_piece_ratio:,.2f}")
+    row1[3].metric("验收人数", f"{result.operator_count:,}")
 
-    kpi5, kpi6, kpi7 = st.columns(3)
-    kpi5.metric("系统操作时长", format_duration(result.total_system_seconds))
-    kpi6.metric("实际验收时长", format_duration(result.total_actual_seconds))
-    kpi7.metric("人效（小时单量）", f"{result.overall_hours_per_order:,.4f}")
+    row2 = st.columns(3)
+    row2[0].metric("系统操作时长", format_duration(result.total_system_seconds))
+    row2[1].metric("实际验收时长", format_duration(result.total_actual_seconds))
+    row2[2].metric("整体人效（小时/单）", f"{result.overall_hours_per_order:.4f}")
 
-    st.subheader("验收人员人效排名")
+    st.subheader("验收人员排名")
     st.dataframe(
         result.ranking,
         use_container_width=True,
@@ -649,32 +884,145 @@ def render_app() -> None:
         },
     )
 
-    st.caption(f"计入计算的有效记录：{result.included_row_count:,} 行。")
+    st.caption(
+        f"有效且已匹配记录：{result.valid_row_count:,}/{result.total_row_count:,} 行；"
+        f"无效记录 {result.invalid_row_count:,} 行；"
+        f"未匹配人员记录 {result.excluded_unmatched_rows:,} 行未呈现。"
+    )
 
-    output_bytes = make_excel_output(result)
     st.download_button(
         "下载验收人效结果 Excel",
-        data=output_bytes,
+        data=make_acceptance_excel(result),
         file_name="验收人效排名结果.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
 
-    with st.expander("计算口径"):
+    with st.expander("验收计算口径"):
         st.markdown(
             """
-- **验收件量**：按验收人汇总计入计算记录中的验收件量。
-- **验收单量**：按人员统计唯一的“京东入库单号”；同一人员重复出现的同一单号只计1单。
-- **单件比**：验收件量 ÷ 验收单量，表示平均每张PI包含的件数。
-- **验收人账号**：自动去除括号和邮箱域名，例如 `US018958(US018958@jd.com)` 转为 `US018958`。
-- **实际姓名**：先匹配人员表中的用户编码/Use ID，再匹配 ERP；未匹配人员不呈现且不计入结果。
-- **系统操作时长**：按验收人、按自然日处理每条系统操作记录的开始至结束区间；同一天内重叠部分只计算一次。
-- **实际验收时长**：同一验收人、同一自然日、同一京东入库单号（PI），取该PI最早开始验收时间至最晚验收时间；再将当天不同PI之间的重叠区间去重，最后把各天时长相加。
-- **人效（小时单量）**：实际验收小时 ÷ 验收单量，单位为小时/单；数值越低，表示平均每单耗时越短。
-- **总验收单量**：所有已匹配记录中的京东入库单号全局去重计数。
-- **总系统操作时长/实际验收时长**：分别将所有已匹配验收人的个人时长相加。
+- **验收件量**：验收量合计。
+- **验收单量**：京东入库单号去重数量。
+- **单件比**：验收件量 ÷ 验收单量。
+- **系统操作时长**：原始操作区间按人员、按自然日去除重叠后相加。
+- **实际验收时长**：每个PI取最早开始至最晚结束，再按人员、按自然日去除PI之间的重叠后相加。
+- **人效（小时单量）**：实际验收小时 ÷ 验收单量，单位为小时/单，越低表示平均每单耗时越短。
+- 未匹配人员不呈现，也不进入总数。
 """
         )
+
+
+def render_picking_module(employee_lookup: EmployeeLookup | None) -> None:
+    picking_files = st.sidebar.file_uploader(
+        "2. 拣货结果文件（可多选）",
+        type=["xlsx", "xls"],
+        accept_multiple_files=True,
+        help="可同时上传多周文件。程序会自动合并，并去除完全重复的明细。",
+        key="picking_data",
+    )
+    if not picking_files:
+        st.info("请上传人员主数据和一个或多个拣货结果文件。")
+        return
+    if employee_lookup is None:
+        st.info("请先上传人员主数据。未匹配员工不会参与结果。")
+        return
+
+    try:
+        with st.spinner(f"正在合并并计算 {len(picking_files)} 个拣货文件……"):
+            combined, file_summary = combine_picking_files(picking_files)
+            result = calculate_picking_productivity(
+                combined,
+                file_summary,
+                employee_lookup,
+            )
+    except Exception as exc:
+        st.error(f"拣货数据处理失败：{exc}")
+        return
+
+    row1 = st.columns(4)
+    row1[0].metric("总拣货件量", f"{result.total_pieces:,.0f}")
+    row1[1].metric("总订单量", f"{result.total_orders:,}")
+    row1[2].metric("总任务单量", f"{result.total_tasks:,}")
+    row1[3].metric("拣货人数", f"{result.operator_count:,}")
+
+    row2 = st.columns(4)
+    row2[0].metric("总实际拣货时长", format_duration(result.total_actual_seconds))
+    row2[1].metric("整体任务件比", f"{result.overall_task_piece_ratio:,.2f}")
+    row2[2].metric("整体小时单量", f"{result.overall_hourly_orders:,.2f}")
+    row2[3].metric("整体小时任务单量", f"{result.overall_hourly_tasks:,.2f}")
+
+    st.subheader("拣货人员排名")
+    st.dataframe(
+        result.ranking,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "排名": st.column_config.NumberColumn(format="%d"),
+            "拣货件量": st.column_config.NumberColumn(format="%d"),
+            "订单量": st.column_config.NumberColumn(format="%d"),
+            "任务单量": st.column_config.NumberColumn(format="%d"),
+            "任务件比": st.column_config.NumberColumn(format="%.2f"),
+            "人效（小时单量）": st.column_config.NumberColumn(format="%.2f"),
+            "小时任务单量": st.column_config.NumberColumn(format="%.2f"),
+        },
+    )
+
+    with st.expander("查看上传文件汇总"):
+        st.dataframe(result.file_summary, use_container_width=True, hide_index=True)
+
+    duplicate_removed = result.uploaded_row_count - result.deduplicated_row_count
+    st.caption(
+        f"上传原始记录 {result.uploaded_row_count:,} 行；"
+        f"跨文件重复明细去除 {duplicate_removed:,} 行；"
+        f"R区排除 {result.r_area_row_count:,} 行；"
+        f"无任务领取/完成时间 {result.missing_time_row_count:,} 行；"
+        f"未匹配人员记录 {result.excluded_unmatched_rows:,} 行未呈现；"
+        f"最终有效记录 {result.valid_row_count:,} 行。"
+    )
+
+    st.download_button(
+        "下载拣货人效结果 Excel",
+        data=make_picking_excel(result),
+        file_name="拣货人效排名结果.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+
+    with st.expander("拣货计算口径"):
+        st.markdown(
+            """
+- 可一次上传多个周文件；程序先合并，再删除完全重复的明细。
+- **R区不参与本阶段计算**：所属储区等于 `R` 的记录全部排除。
+- 没有任务领取时间或拣货完成时间的记录不参与人效。
+- **拣货件量**：实际拣货量合计。
+- **订单量**：订单号去重数量。
+- **任务单量**：任务单号去重数量。
+- **任务件比**：拣货件量 ÷ 任务单量。
+- **实际拣货时长**：每个任务从任务领取时间到该任务最晚拣货完成时间；同一人员同一天内的任务时间发生重叠时，重叠部分只计算一次。
+- **人效（小时单量）**：订单量 ÷ 实际拣货小时，单位为订单/小时，越高越好。
+- **小时任务单量**：任务单量 ÷ 实际拣货小时，单位为任务/小时，越高越好。
+- 未匹配人员不呈现，也不进入总数。
+"""
+        )
+
+
+def render_app() -> None:
+    st.set_page_config(page_title=APP_TITLE, page_icon="📊", layout="wide")
+    st.title(APP_TITLE)
+    st.caption("统一人员主数据｜验收与拣货人效分析｜结果可下载为Excel")
+
+    with st.sidebar:
+        st.header("业务模块")
+        module = st.radio("选择分析环节", ["验收", "拣货"], horizontal=True)
+        st.divider()
+        st.header("数据上传")
+
+    employee_lookup = render_employee_upload()
+
+    if module == "验收":
+        render_acceptance_module(employee_lookup)
+    else:
+        render_picking_module(employee_lookup)
 
 
 if __name__ == "__main__":
