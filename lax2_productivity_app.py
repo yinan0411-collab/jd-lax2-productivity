@@ -13,6 +13,7 @@ import streamlit as st
 APP_TITLE = "LAX2 人效分析工具"
 
 ACCEPTANCE_COLUMNS = {
+    "order": "京东入库单号",
     "quantity": "验收量",
     "operator": "验收人",
     "start": "开始验收时间",
@@ -39,10 +40,11 @@ class EmployeeLookup:
 @dataclass(frozen=True)
 class AcceptanceResult:
     ranking: pd.DataFrame
-    invalid_rows: pd.DataFrame
     total_quantity: float
+    total_order_count: int
     total_effective_seconds: float
     overall_hourly_productivity: float
+    overall_order_productivity: float
     operator_count: int
     included_row_count: int
     total_row_count: int
@@ -80,12 +82,7 @@ def clean_name(value: object) -> str:
 
 
 def extract_operator_id(value: object) -> str:
-    """将验收人字段转换为可用于人员主数据匹配的账号。
-
-    示例：
-    US018958(US018958@jd.com) -> US018958
-    fang.yang@jd.com          -> fang.yang
-    """
+    """将验收人字段转换为人员主数据可匹配的账号。"""
     if value is None or pd.isna(value):
         return ""
 
@@ -210,6 +207,42 @@ def format_duration(total_seconds: float) -> str:
     return f"{hours}:{minutes:02d}:{seconds:02d}"
 
 
+def merge_overlapping_seconds(group: pd.DataFrame) -> float:
+    """同一人员的重叠时间只计算一次；不使用额外的间隔阈值。"""
+    intervals = (
+        group[["开始时间", "结束时间"]]
+        .sort_values(["开始时间", "结束时间"])
+        .itertuples(index=False, name=None)
+    )
+
+    total_seconds = 0.0
+    current_start: pd.Timestamp | None = None
+    current_end: pd.Timestamp | None = None
+
+    for start, end in intervals:
+        if current_start is None:
+            current_start, current_end = start, end
+            continue
+
+        # 重叠或首尾相接的区间合并；中间有空档则分别计算。
+        if start <= current_end:
+            if end > current_end:
+                current_end = end
+        else:
+            total_seconds += (current_end - current_start).total_seconds()
+            current_start, current_end = start, end
+
+    if current_start is not None and current_end is not None:
+        total_seconds += (current_end - current_start).total_seconds()
+
+    return float(total_seconds)
+
+
+def count_unique_orders(series: pd.Series) -> int:
+    cleaned = series.fillna("").astype(str).str.strip()
+    return int(cleaned[cleaned.ne("")].nunique())
+
+
 def calculate_acceptance_productivity(
     acceptance_df: pd.DataFrame,
     employee_lookup: EmployeeLookup,
@@ -221,10 +254,12 @@ def calculate_acceptance_productivity(
         raise ValueError("验收表缺少必要字段：" + "、".join(missing_columns))
 
     work = acceptance_df[list(ACCEPTANCE_COLUMNS.values())].copy()
-    work["原始行号"] = np.arange(2, len(work) + 2)
     work["验收人账号"] = work[ACCEPTANCE_COLUMNS["operator"]].map(extract_operator_id)
     work["实际姓名"] = work["验收人账号"].map(
         lambda value: match_employee(value, employee_lookup)
+    )
+    work["京东入库单号清洗"] = (
+        work[ACCEPTANCE_COLUMNS["order"]].fillna("").astype(str).str.strip()
     )
     work["验收量数值"] = pd.to_numeric(
         work[ACCEPTANCE_COLUMNS["quantity"]], errors="coerce"
@@ -244,28 +279,35 @@ def calculate_acceptance_productivity(
         & work["结束时间"].notna()
         & (work["结束时间"] >= work["开始时间"])
     )
-
-    invalid_rows = work.loc[~valid_mask].copy()
     valid = work.loc[valid_mask].copy()
 
     if valid.empty:
         raise ValueError("没有可用于计算的人效记录，请检查人员表、验收量和时间字段。")
 
-    # 用户指定口径：每一行的最后验收时间减去开始验收时间，再按人员直接相加。
-    valid["有效秒数"] = (valid["结束时间"] - valid["开始时间"]).dt.total_seconds()
-
-    ranking = (
-        valid.groupby(["验收人账号", "实际姓名"], as_index=False)
-        .agg(
-            验收量=("验收量数值", "sum"),
-            有效秒数=("有效秒数", "sum"),
+    ranking_rows: list[dict[str, object]] = []
+    for (operator_id, employee_name), group in valid.groupby(
+        ["验收人账号", "实际姓名"], sort=False
+    ):
+        ranking_rows.append(
+            {
+                "验收人账号": operator_id,
+                "实际姓名": employee_name,
+                "验收量": float(group["验收量数值"].sum()),
+                "验收单量": count_unique_orders(group["京东入库单号清洗"]),
+                "有效秒数": merge_overlapping_seconds(group),
+            }
         )
-    )
 
+    ranking = pd.DataFrame(ranking_rows)
     ranking["有效工作小时"] = ranking["有效秒数"] / 3600
     ranking["小时人效"] = np.where(
         ranking["有效工作小时"] > 0,
         ranking["验收量"] / ranking["有效工作小时"],
+        np.nan,
+    )
+    ranking["人效（单量）"] = np.where(
+        ranking["有效工作小时"] > 0,
+        ranking["验收单量"] / ranking["有效工作小时"],
         np.nan,
     )
 
@@ -276,10 +318,18 @@ def calculate_acceptance_productivity(
     ranking["总有效工作时长"] = ranking["有效秒数"].map(format_duration)
 
     total_quantity = float(ranking["验收量"].sum())
+    total_order_count = count_unique_orders(valid["京东入库单号清洗"])
     total_effective_seconds = float(ranking["有效秒数"].sum())
+    total_effective_hours = total_effective_seconds / 3600
+
     overall_hourly_productivity = (
-        total_quantity / (total_effective_seconds / 3600)
-        if total_effective_seconds > 0
+        total_quantity / total_effective_hours
+        if total_effective_hours > 0
+        else float("nan")
+    )
+    overall_order_productivity = (
+        total_order_count / total_effective_hours
+        if total_effective_hours > 0
         else float("nan")
     )
 
@@ -289,17 +339,20 @@ def calculate_acceptance_productivity(
             "验收人账号",
             "实际姓名",
             "验收量",
+            "验收单量",
             "总有效工作时长",
             "小时人效",
+            "人效（单量）",
         ]
     ].copy()
 
     return AcceptanceResult(
         ranking=ranking_display,
-        invalid_rows=invalid_rows,
         total_quantity=total_quantity,
+        total_order_count=total_order_count,
         total_effective_seconds=total_effective_seconds,
         overall_hourly_productivity=overall_hourly_productivity,
+        overall_order_productivity=overall_order_productivity,
         operator_count=len(ranking_display),
         included_row_count=len(valid),
         total_row_count=len(work),
@@ -335,18 +388,22 @@ def make_excel_output(result: AcceptanceResult) -> bytes:
             {
                 "项目": [
                     "验收量",
-                    "单行有效工作时长",
+                    "验收单量",
                     "个人总有效工作时长",
                     "小时人效",
+                    "人效（单量）",
                     "人员匹配",
+                    "总验收单量",
                     "整体总有效工作时长",
                 ],
                 "计算口径": [
                     "按验收人汇总计入计算记录中的验收量",
-                    "每一行均按最后验收时间减去开始验收时间计算",
-                    "将该验收人的所有单行有效工作时长直接相加，不合并重叠时间，也不判断记录间隔",
+                    "按验收人对京东入库单号去重计数；同一人员重复出现的同一单号只计1单",
+                    "合并同一验收人的开始至结束时间区间；实际重叠时间只计算一次，不使用额外间隔阈值",
                     "验收量 ÷ 有效工作小时",
+                    "验收单量 ÷ 有效工作小时",
                     "先匹配用户编码/Use ID，再匹配ERP；账号中的@域名自动移除；未匹配人员不呈现且不计入结果",
+                    "所有已匹配记录中的京东入库单号全局去重计数",
                     "所有已匹配验收人的个人总有效工作时长相加",
                 ],
             }
@@ -377,13 +434,13 @@ def make_excel_output(result: AcceptanceResult) -> bytes:
         ranking_sheet.set_column("A:A", 8, integer_format)
         ranking_sheet.set_column("B:B", 24, text_format)
         ranking_sheet.set_column("C:C", 22, text_format)
-        ranking_sheet.set_column("D:D", 14, integer_format)
-        ranking_sheet.set_column("E:E", 20, text_format)
-        ranking_sheet.set_column("F:F", 14, decimal_format)
+        ranking_sheet.set_column("D:E", 14, integer_format)
+        ranking_sheet.set_column("F:F", 20, text_format)
+        ranking_sheet.set_column("G:H", 16, decimal_format)
 
         method_sheet = writer.sheets["计算口径"]
         method_sheet.set_row(0, 24, header_format)
-        method_sheet.set_column("A:A", 22)
+        method_sheet.set_column("A:A", 24)
         method_sheet.set_column("B:B", 100)
         method_sheet.set_default_row(30)
 
@@ -393,7 +450,7 @@ def make_excel_output(result: AcceptanceResult) -> bytes:
 def render_app() -> None:
     st.set_page_config(page_title=APP_TITLE, page_icon="📊", layout="wide")
     st.title(APP_TITLE)
-    st.caption("第一阶段：验收小时人效｜人员主数据可复用于后续所有业务模块")
+    st.caption("第一阶段：验收人效｜人员主数据可复用于后续所有业务模块")
 
     with st.sidebar:
         st.header("数据上传")
@@ -455,11 +512,15 @@ def render_app() -> None:
         st.error(f"处理失败：{exc}")
         return
 
-    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+    kpi1, kpi2, kpi3 = st.columns(3)
     kpi1.metric("总验收量", f"{result.total_quantity:,.0f}")
-    kpi2.metric("总有效工作时长", format_duration(result.total_effective_seconds))
-    kpi3.metric("整体小时人效", f"{result.overall_hourly_productivity:,.2f}")
-    kpi4.metric("验收人数", f"{result.operator_count:,}")
+    kpi2.metric("总验收单量", f"{result.total_order_count:,}")
+    kpi3.metric("总有效工作时长", format_duration(result.total_effective_seconds))
+
+    kpi4, kpi5, kpi6 = st.columns(3)
+    kpi4.metric("整体小时人效", f"{result.overall_hourly_productivity:,.2f}")
+    kpi5.metric("整体单量人效", f"{result.overall_order_productivity:,.2f}")
+    kpi6.metric("验收人数", f"{result.operator_count:,}")
 
     st.subheader("验收人员小时人效排名")
     st.dataframe(
@@ -469,7 +530,9 @@ def render_app() -> None:
         column_config={
             "排名": st.column_config.NumberColumn(format="%d"),
             "验收量": st.column_config.NumberColumn(format="%d"),
+            "验收单量": st.column_config.NumberColumn(format="%d"),
             "小时人效": st.column_config.NumberColumn(format="%.2f"),
+            "人效（单量）": st.column_config.NumberColumn(format="%.2f"),
         },
     )
 
@@ -488,11 +551,13 @@ def render_app() -> None:
         st.markdown(
             """
 - **验收量**：按验收人汇总计入计算记录中的验收量。
+- **验收单量**：按人员统计唯一的“京东入库单号”；同一人员重复出现的同一单号只计1单。
 - **验收人账号**：自动去除括号和邮箱域名，例如 `US018958(US018958@jd.com)` 转为 `US018958`。
 - **实际姓名**：先匹配人员表中的用户编码/Use ID，再匹配 ERP；未匹配人员不呈现且不计入结果。
-- **单行有效工作时长**：最后验收时间 − 开始验收时间。
-- **个人总有效工作时长**：该人员所有单行有效工作时长直接相加，不合并重叠时间，也不判断间隔。
+- **个人总有效工作时长**：合并同一人员实际重叠的开始/结束时间区间，重叠部分只计算一次；不使用额外间隔阈值。
 - **小时人效**：验收量 ÷ 有效工作小时。
+- **人效（单量）**：验收单量 ÷ 有效工作小时。
+- **总验收单量**：所有已匹配记录中的京东入库单号全局去重计数。
 - **总有效工作时长**：所有已匹配验收人的个人总有效工作时长相加。
 """
         )
