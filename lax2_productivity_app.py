@@ -24,6 +24,7 @@ EMPLOYEE_COLUMN_ALIASES = {
     "user_id": ["用户编码", "Use ID", "UseID", "User ID", "userid", "use id"],
     "erp": ["ERP", "erp"],
     "name": ["姓名", "员工姓名", "Name", "Employee Name"],
+    "attendance_group": ["考勤组", "考勤组名称", "Attendance Group", "AttendanceGroup"],
 }
 
 ACCEPTANCE_COLUMNS = {
@@ -63,6 +64,10 @@ class EmployeeLookup:
     exact_erp: dict[str, str]
     normalized_user_id: dict[str, str]
     normalized_erp: dict[str, str]
+    exact_user_id_group: dict[str, str]
+    exact_erp_group: dict[str, str]
+    normalized_user_id_group: dict[str, str]
+    normalized_erp_group: dict[str, str]
     duplicate_keys: list[str]
     source_rows: int
 
@@ -94,6 +99,7 @@ class PickingResult:
     overall_task_piece_ratio: float
     overall_hourly_orders: float
     overall_hourly_tasks: float
+    overall_hourly_pieces: float
     operator_count: int
     uploaded_row_count: int
     deduplicated_row_count: int
@@ -112,6 +118,7 @@ class PackingResult:
     total_effective_seconds: float
     overall_piece_order_ratio: float
     overall_hourly_orders: float
+    overall_hourly_pieces: float
     operator_count: int
     uploaded_row_count: int
     deduplicated_row_count: int
@@ -215,6 +222,9 @@ def build_employee_lookup(employee_df: pd.DataFrame) -> EmployeeLookup:
     user_id_col = find_column(employee_df.columns, EMPLOYEE_COLUMN_ALIASES["user_id"])
     erp_col = find_column(employee_df.columns, EMPLOYEE_COLUMN_ALIASES["erp"])
     name_col = find_column(employee_df.columns, EMPLOYEE_COLUMN_ALIASES["name"])
+    attendance_group_col = find_column(
+        employee_df.columns, EMPLOYEE_COLUMN_ALIASES["attendance_group"]
+    )
 
     if name_col is None:
         raise ValueError(
@@ -227,52 +237,75 @@ def build_employee_lookup(employee_df: pd.DataFrame) -> EmployeeLookup:
     exact_erp: dict[str, str] = {}
     normalized_user_id: dict[str, str] = {}
     normalized_erp: dict[str, str] = {}
+    exact_user_id_group: dict[str, str] = {}
+    exact_erp_group: dict[str, str] = {}
+    normalized_user_id_group: dict[str, str] = {}
+    normalized_erp_group: dict[str, str] = {}
     duplicate_keys: list[str] = []
 
     for _, row in employee_df.iterrows():
         name = clean_name(row.get(name_col))
         if not name:
             continue
+        attendance_group = (
+            clean_name(row.get(attendance_group_col)) if attendance_group_col else ""
+        )
 
         if user_id_col is not None:
             raw_user_id = row.get(user_id_col)
+            exact_key = canonical_key(raw_user_id)
+            normalized_key = compact_key(raw_user_id)
             _add_lookup_value(
                 exact_user_id,
-                canonical_key(raw_user_id),
+                exact_key,
                 name,
                 duplicate_keys,
                 "用户编码",
             )
             _add_lookup_value(
                 normalized_user_id,
-                compact_key(raw_user_id),
+                normalized_key,
                 name,
                 duplicate_keys,
                 "标准化用户编码",
             )
+            if exact_key:
+                exact_user_id_group.setdefault(exact_key, attendance_group)
+            if normalized_key:
+                normalized_user_id_group.setdefault(normalized_key, attendance_group)
 
         if erp_col is not None:
             raw_erp = row.get(erp_col)
+            exact_key = canonical_key(raw_erp)
+            normalized_key = compact_key(raw_erp)
             _add_lookup_value(
                 exact_erp,
-                canonical_key(raw_erp),
+                exact_key,
                 name,
                 duplicate_keys,
                 "ERP",
             )
             _add_lookup_value(
                 normalized_erp,
-                compact_key(raw_erp),
+                normalized_key,
                 name,
                 duplicate_keys,
                 "标准化ERP",
             )
+            if exact_key:
+                exact_erp_group.setdefault(exact_key, attendance_group)
+            if normalized_key:
+                normalized_erp_group.setdefault(normalized_key, attendance_group)
 
     return EmployeeLookup(
         exact_user_id=exact_user_id,
         exact_erp=exact_erp,
         normalized_user_id=normalized_user_id,
         normalized_erp=normalized_erp,
+        exact_user_id_group=exact_user_id_group,
+        exact_erp_group=exact_erp_group,
+        normalized_user_id_group=normalized_user_id_group,
+        normalized_erp_group=normalized_erp_group,
         duplicate_keys=sorted(set(duplicate_keys)),
         source_rows=len(employee_df),
     )
@@ -295,6 +328,26 @@ def match_employee_name(operator_id: str, lookup: EmployeeLookup | None) -> str:
         return lookup.normalized_erp[compact]
     return ""
 
+
+def match_employee_attendance_group(
+    operator_id: str, lookup: EmployeeLookup | None
+) -> str:
+    """Return the employee attendance group; missing source values remain blank."""
+    if lookup is None:
+        return ""
+
+    exact = canonical_key(operator_id)
+    compact = compact_key(operator_id)
+
+    if exact in lookup.exact_user_id:
+        return lookup.exact_user_id_group.get(exact, "")
+    if exact in lookup.exact_erp:
+        return lookup.exact_erp_group.get(exact, "")
+    if compact and compact in lookup.normalized_user_id:
+        return lookup.normalized_user_id_group.get(compact, "")
+    if compact and compact in lookup.normalized_erp:
+        return lookup.normalized_erp_group.get(compact, "")
+    return ""
 
 def format_duration(total_seconds: float) -> str:
     rounded = max(int(round(total_seconds)), 0)
@@ -421,6 +474,9 @@ def calculate_acceptance_productivity(
     work["实际姓名"] = work["验收人账号"].map(
         lambda value: match_employee_name(value, employee_lookup)
     )
+    work["考勤组"] = work["验收人账号"].map(
+        lambda value: match_employee_attendance_group(value, employee_lookup)
+    )
     work["PI"] = work[ACCEPTANCE_COLUMNS["pi"]].map(clean_identifier)
     work["验收件量数值"] = pd.to_numeric(
         work[ACCEPTANCE_COLUMNS["quantity"]], errors="coerce"
@@ -461,7 +517,7 @@ def calculate_acceptance_productivity(
     ).rename(columns={"账号": "验收人账号", "秒数": "实际验收秒数"})
 
     summary = (
-        valid.groupby(["验收人账号", "实际姓名"], as_index=False)
+        valid.groupby(["验收人账号", "实际姓名", "考勤组"], as_index=False)
         .agg(
             验收件量=("验收件量数值", "sum"),
             验收单量=("PI", "nunique"),
@@ -487,8 +543,8 @@ def calculate_acceptance_productivity(
     summary["实际验收时长"] = summary["实际验收秒数"].map(format_duration)
 
     summary = summary.sort_values(
-        ["人效（小时单量）", "验收件量"],
-        ascending=[True, False],
+        ["验收单量", "验收件量", "人效（小时单量）"],
+        ascending=[False, False, True],
         na_position="last",
     ).reset_index(drop=True)
     summary.insert(0, "排名", np.arange(1, len(summary) + 1))
@@ -498,6 +554,7 @@ def calculate_acceptance_productivity(
             "排名",
             "验收人账号",
             "实际姓名",
+            "考勤组",
             "验收件量",
             "验收单量",
             "单件比",
@@ -590,6 +647,9 @@ def calculate_picking_productivity(
     work["实际姓名"] = work["拣货人账号"].map(
         lambda value: match_employee_name(value, employee_lookup)
     )
+    work["考勤组"] = work["拣货人账号"].map(
+        lambda value: match_employee_attendance_group(value, employee_lookup)
+    )
     work["订单号标准值"] = work[PICKING_COLUMNS["order"]].map(clean_identifier)
     work["任务单号标准值"] = work[PICKING_COLUMNS["task"]].map(clean_identifier)
     work["拣货件量数值"] = pd.to_numeric(
@@ -634,7 +694,7 @@ def calculate_picking_productivity(
     ).rename(columns={"账号": "拣货人账号", "秒数": "实际拣货秒数"})
 
     summary = (
-        valid.groupby(["拣货人账号", "实际姓名"], as_index=False)
+        valid.groupby(["拣货人账号", "实际姓名", "考勤组"], as_index=False)
         .agg(
             拣货件量=("拣货件量数值", "sum"),
             订单量=("订单号标准值", "nunique"),
@@ -659,10 +719,15 @@ def calculate_picking_productivity(
         summary["任务单量"] / summary["实际拣货小时"],
         np.nan,
     )
+    summary["人效（小时件效）"] = np.where(
+        summary["实际拣货小时"] > 0,
+        summary["拣货件量"] / summary["实际拣货小时"],
+        np.nan,
+    )
     summary["实际拣货时长"] = summary["实际拣货秒数"].map(format_duration)
 
     summary = summary.sort_values(
-        ["人效（小时单量）", "小时任务单量", "拣货件量"],
+        ["订单量", "拣货件量", "人效（小时单量）"],
         ascending=[False, False, False],
         na_position="last",
     ).reset_index(drop=True)
@@ -673,6 +738,7 @@ def calculate_picking_productivity(
             "排名",
             "拣货人账号",
             "实际姓名",
+            "考勤组",
             "拣货件量",
             "订单量",
             "任务单量",
@@ -680,6 +746,7 @@ def calculate_picking_productivity(
             "实际拣货时长",
             "人效（小时单量）",
             "小时任务单量",
+            "人效（小时件效）",
         ]
     ].copy()
 
@@ -699,6 +766,7 @@ def calculate_picking_productivity(
         overall_task_piece_ratio=(total_pieces / total_tasks if total_tasks else float("nan")),
         overall_hourly_orders=(total_orders / total_hours if total_hours else float("nan")),
         overall_hourly_tasks=(total_tasks / total_hours if total_hours else float("nan")),
+        overall_hourly_pieces=(total_pieces / total_hours if total_hours else float("nan")),
         operator_count=len(summary),
         uploaded_row_count=uploaded_row_count,
         deduplicated_row_count=deduplicated_row_count,
@@ -810,6 +878,9 @@ def calculate_packing_productivity(
     work["实际姓名"] = work["打包人账号"].map(
         lambda value: match_employee_name(value, employee_lookup)
     )
+    work["考勤组"] = work["打包人账号"].map(
+        lambda value: match_employee_attendance_group(value, employee_lookup)
+    )
     work["订单号标准值"] = work[PACKING_COLUMNS["order"]].map(clean_identifier)
     work["打包件量数值"] = pd.to_numeric(
         work[PACKING_COLUMNS["quantity"]], errors="coerce"
@@ -837,7 +908,7 @@ def calculate_packing_productivity(
     # use its latest timestamp as the order's completion event.
     order_events = (
         valid.groupby(
-            ["打包人账号", "实际姓名", "订单号标准值"], as_index=False
+            ["打包人账号", "实际姓名", "考勤组", "订单号标准值"], as_index=False
         )
         .agg(
             打包件量=("打包件量数值", "sum"),
@@ -853,7 +924,7 @@ def calculate_packing_productivity(
     ).rename(columns={"账号": "打包人账号", "秒数": "有效打包秒数"})
 
     summary = (
-        order_events.groupby(["打包人账号", "实际姓名"], as_index=False)
+        order_events.groupby(["打包人账号", "实际姓名", "考勤组"], as_index=False)
         .agg(
             打包件量=("打包件量", "sum"),
             订单量=("订单号标准值", "nunique"),
@@ -872,10 +943,15 @@ def calculate_packing_productivity(
         summary["订单量"] / summary["有效打包小时"],
         np.nan,
     )
+    summary["人效（小时件效）"] = np.where(
+        summary["有效打包小时"] > 0,
+        summary["打包件量"] / summary["有效打包小时"],
+        np.nan,
+    )
     summary["有效打包时长"] = summary["有效打包秒数"].map(format_duration)
 
     summary = summary.sort_values(
-        ["人效（小时单量）", "订单量", "打包件量"],
+        ["订单量", "打包件量", "人效（小时单量）"],
         ascending=[False, False, False],
         na_position="last",
     ).reset_index(drop=True)
@@ -886,11 +962,13 @@ def calculate_packing_productivity(
             "排名",
             "打包人账号",
             "实际姓名",
+            "考勤组",
             "打包件量",
             "订单量",
             "件单比",
             "有效打包时长",
             "人效（小时单量）",
+            "人效（小时件效）",
         ]
     ].copy()
 
@@ -910,6 +988,9 @@ def calculate_packing_productivity(
         ),
         overall_hourly_orders=(
             total_orders / total_hours if total_hours else float("nan")
+        ),
+        overall_hourly_pieces=(
+            total_pieces / total_hours if total_hours else float("nan")
         ),
         operator_count=len(summary),
         uploaded_row_count=uploaded_row_count,
@@ -945,21 +1026,25 @@ def make_acceptance_excel(result: AcceptanceResult) -> bytes:
         method = pd.DataFrame(
             {
                 "项目": [
+                    "考勤组",
                     "验收件量",
                     "验收单量",
                     "单件比",
                     "系统操作时长",
                     "实际验收时长",
                     "人效（小时单量）",
+                    "排名规则",
                     "人员范围",
                 ],
                 "计算口径": [
+                    "从人员主数据中的考勤组字段匹配；源数据为空时结果保持为空",
                     "按人员汇总验收量",
                     "京东入库单号去重数量",
                     "验收件量 ÷ 验收单量",
                     "原始系统操作区间按人员、按自然日去除重叠后相加",
                     "单个PI取最早开始至最晚结束；同一人员同一天的PI区间去除重叠后相加",
                     "实际验收小时 ÷ 验收单量（小时/单，越低表示平均每单用时越短）",
+                    "优先按照实际完成的验收单量从高到低排名；单量相同时依次参考验收件量和平均每单用时",
                     "仅保留成功匹配人员主数据的员工",
                 ],
             }
@@ -972,20 +1057,19 @@ def make_acceptance_excel(result: AcceptanceResult) -> bytes:
         sheet.freeze_panes(1, 0)
         sheet.autofilter(0, 0, len(result.ranking), len(result.ranking.columns) - 1)
         sheet.set_row(0, 24, fmt["header"])
-        widths = [8, 22, 22, 14, 14, 12, 18, 18, 18]
+        widths = [8, 22, 22, 18, 14, 14, 12, 18, 18, 18]
         for col_idx, width in enumerate(widths):
             sheet.set_column(col_idx, col_idx, width)
         sheet.set_column(0, 0, 8, fmt["integer"])
-        sheet.set_column(3, 4, 14, fmt["integer"])
-        sheet.set_column(5, 5, 12, fmt["decimal"])
-        sheet.set_column(8, 8, 18, fmt["decimal4"])
+        sheet.set_column(4, 5, 14, fmt["integer"])
+        sheet.set_column(6, 6, 12, fmt["decimal"])
+        sheet.set_column(9, 9, 18, fmt["decimal4"])
 
         method_sheet = writer.sheets["计算口径"]
         method_sheet.set_row(0, 24, fmt["header"])
         method_sheet.set_column("A:A", 22)
-        method_sheet.set_column("B:B", 100)
+        method_sheet.set_column("B:B", 110)
     return output.getvalue()
-
 
 def make_picking_excel(result: PickingResult) -> bytes:
     output = io.BytesIO()
@@ -997,6 +1081,7 @@ def make_picking_excel(result: PickingResult) -> bytes:
                 "项目": [
                     "R区",
                     "多文件合并",
+                    "考勤组",
                     "拣货件量",
                     "订单量",
                     "任务单量",
@@ -1004,11 +1089,14 @@ def make_picking_excel(result: PickingResult) -> bytes:
                     "实际拣货时长",
                     "人效（小时单量）",
                     "小时任务单量",
+                    "人效（小时件效）",
+                    "排名规则",
                     "人员范围",
                 ],
                 "计算口径": [
                     "所属储区等于R的记录全部排除，本阶段不参与计算",
                     "允许同时上传多个周文件；完全重复的明细仅保留一条",
+                    "从人员主数据中的考勤组字段匹配；源数据为空时结果保持为空",
                     "实际拣货量合计",
                     "订单号去重数量",
                     "任务单号去重数量",
@@ -1016,6 +1104,8 @@ def make_picking_excel(result: PickingResult) -> bytes:
                     "每个任务取任务领取时间至最晚拣货完成时间；同一人员同一天的任务区间去除重叠后相加",
                     "订单量 ÷ 实际拣货小时（订单/小时，越高越好）",
                     "任务单量 ÷ 实际拣货小时（任务/小时，越高越好）",
+                    "拣货件量 ÷ 实际拣货小时（件/小时，越高越好）",
+                    "优先按照实际完成的订单量从高到低排名；订单量相同时依次参考拣货件量和小时单量",
                     "仅保留有任务领取时间且成功匹配人员主数据的员工",
                 ],
             }
@@ -1028,13 +1118,13 @@ def make_picking_excel(result: PickingResult) -> bytes:
         sheet.freeze_panes(1, 0)
         sheet.autofilter(0, 0, len(result.ranking), len(result.ranking.columns) - 1)
         sheet.set_row(0, 24, fmt["header"])
-        widths = [8, 22, 22, 14, 12, 12, 12, 18, 18, 16]
+        widths = [8, 22, 22, 18, 14, 12, 12, 12, 18, 18, 16, 18]
         for col_idx, width in enumerate(widths):
             sheet.set_column(col_idx, col_idx, width)
         sheet.set_column(0, 0, 8, fmt["integer"])
-        sheet.set_column(3, 5, 14, fmt["integer"])
-        sheet.set_column(6, 6, 12, fmt["decimal"])
-        sheet.set_column(8, 9, 18, fmt["decimal"])
+        sheet.set_column(4, 6, 14, fmt["integer"])
+        sheet.set_column(7, 7, 12, fmt["decimal"])
+        sheet.set_column(9, 11, 18, fmt["decimal"])
 
         file_sheet = writer.sheets["上传文件汇总"]
         file_sheet.set_row(0, 24, fmt["header"])
@@ -1044,10 +1134,8 @@ def make_picking_excel(result: PickingResult) -> bytes:
         method_sheet = writer.sheets["计算口径"]
         method_sheet.set_row(0, 24, fmt["header"])
         method_sheet.set_column("A:A", 22)
-        method_sheet.set_column("B:B", 105)
+        method_sheet.set_column("B:B", 110)
     return output.getvalue()
-
-
 
 def make_packing_excel(result: PackingResult, gap_minutes: int) -> bytes:
     output = io.BytesIO()
@@ -1058,6 +1146,7 @@ def make_packing_excel(result: PackingResult, gap_minutes: int) -> bytes:
             {
                 "项目": [
                     "多文件合并",
+                    "考勤组",
                     "打包件量",
                     "订单量",
                     "件单比",
@@ -1065,10 +1154,13 @@ def make_packing_excel(result: PackingResult, gap_minutes: int) -> bytes:
                     "有效打包时长",
                     "连续打包阈值",
                     "人效（小时单量）",
+                    "人效（小时件效）",
+                    "排名规则",
                     "人员范围",
                 ],
                 "计算口径": [
                     "允许同时上传多个文件；仅删除因文件时间范围重叠而重复出现的商品明细，单个源文件内的原始行保持不变",
+                    "从人员主数据中的考勤组字段匹配；源数据为空时结果保持为空",
                     "实际打包件数合计",
                     "订单号去重数量；一个订单只计一次",
                     "打包件量 ÷ 订单量",
@@ -1076,6 +1168,8 @@ def make_packing_excel(result: PackingResult, gap_minutes: int) -> bytes:
                     "按人员和自然日排列订单完成时间；相邻订单间隔不超过阈值时，该间隔计入有效打包时长",
                     f"当前设置为 {gap_minutes} 分钟；超过阈值的空档不计入有效打包时长",
                     "订单量 ÷ 有效打包小时（订单/小时，越高越好）",
+                    "打包件量 ÷ 有效打包小时（件/小时，越高越好）",
+                    "优先按照实际完成的订单量从高到低排名；订单量相同时依次参考打包件量和小时单量",
                     "仅保留成功匹配人员主数据的员工",
                 ],
             }
@@ -1088,13 +1182,13 @@ def make_packing_excel(result: PackingResult, gap_minutes: int) -> bytes:
         sheet.freeze_panes(1, 0)
         sheet.autofilter(0, 0, len(result.ranking), len(result.ranking.columns) - 1)
         sheet.set_row(0, 24, fmt["header"])
-        widths = [8, 22, 22, 14, 12, 12, 18, 18]
+        widths = [8, 22, 22, 18, 14, 12, 12, 18, 18, 18]
         for col_idx, width in enumerate(widths):
             sheet.set_column(col_idx, col_idx, width)
         sheet.set_column(0, 0, 8, fmt["integer"])
-        sheet.set_column(3, 4, 14, fmt["integer"])
-        sheet.set_column(5, 5, 12, fmt["decimal"])
-        sheet.set_column(7, 7, 18, fmt["decimal"])
+        sheet.set_column(4, 5, 14, fmt["integer"])
+        sheet.set_column(6, 6, 12, fmt["decimal"])
+        sheet.set_column(8, 9, 18, fmt["decimal"])
 
         file_sheet = writer.sheets["上传文件汇总"]
         file_sheet.set_row(0, 24, fmt["header"])
@@ -1104,14 +1198,14 @@ def make_packing_excel(result: PackingResult, gap_minutes: int) -> bytes:
         method_sheet = writer.sheets["计算口径"]
         method_sheet.set_row(0, 24, fmt["header"])
         method_sheet.set_column("A:A", 22)
-        method_sheet.set_column("B:B", 105)
+        method_sheet.set_column("B:B", 110)
     return output.getvalue()
 
 def render_employee_upload() -> EmployeeLookup | None:
     employee_file = st.sidebar.file_uploader(
         "1. 人员主数据",
         type=["xlsx", "xls"],
-        help="验收、拣货与打包共用。支持用户编码/Use ID、ERP和姓名字段。",
+        help="验收、拣货与打包共用。支持用户编码/Use ID、ERP、姓名和考勤组字段；考勤组为空时结果保持为空。",
         key="employee_master",
     )
     if employee_file is None:
@@ -1126,13 +1220,12 @@ def render_employee_upload() -> EmployeeLookup | None:
         st.sidebar.success(f"人员主数据已读取：{lookup.source_rows:,} 行")
         if lookup.duplicate_keys:
             st.sidebar.warning(
-                f"发现 {len(lookup.duplicate_keys)} 个重复匹配键，保留首次出现的姓名。"
+                f"发现 {len(lookup.duplicate_keys)} 个重复匹配键，保留首次出现的姓名和考勤组。"
             )
         return lookup
     except Exception as exc:
         st.sidebar.error(f"人员表读取失败：{exc}")
         return None
-
 
 def render_acceptance_module(employee_lookup: EmployeeLookup | None) -> None:
     acceptance_file = st.sidebar.file_uploader(
@@ -1174,7 +1267,7 @@ def render_acceptance_module(employee_lookup: EmployeeLookup | None) -> None:
     row2[1].metric("实际验收时长", format_duration(result.total_actual_seconds))
     row2[2].metric("整体人效（小时/单）", f"{result.overall_hours_per_order:.4f}")
 
-    st.subheader("验收人员排名")
+    st.subheader("验收人员排名（按验收单量）")
     st.dataframe(
         result.ranking,
         use_container_width=True,
@@ -1189,6 +1282,7 @@ def render_acceptance_module(employee_lookup: EmployeeLookup | None) -> None:
     )
 
     st.caption(
+        f"排名优先按照实际完成的验收单量从高到低；"
         f"有效且已匹配记录：{result.valid_row_count:,}/{result.total_row_count:,} 行；"
         f"无效记录 {result.invalid_row_count:,} 行；"
         f"未匹配人员记录 {result.excluded_unmatched_rows:,} 行未呈现。"
@@ -1205,16 +1299,17 @@ def render_acceptance_module(employee_lookup: EmployeeLookup | None) -> None:
     with st.expander("验收计算口径"):
         st.markdown(
             """
+- **考勤组**：从人员主数据匹配，人员表没有考勤组或该字段为空时显示为空。
 - **验收件量**：验收量合计。
 - **验收单量**：京东入库单号去重数量。
 - **单件比**：验收件量 ÷ 验收单量。
 - **系统操作时长**：原始操作区间按人员、按自然日去除重叠后相加。
 - **实际验收时长**：每个PI取最早开始至最晚结束，再按人员、按自然日去除PI之间的重叠后相加。
 - **人效（小时单量）**：实际验收小时 ÷ 验收单量，单位为小时/单，越低表示平均每单耗时越短。
+- **排名**：优先按照实际完成的验收单量从高到低排名；单量相同再参考验收件量和平均每单用时。
 - 未匹配人员不呈现，也不进入总数。
 """
         )
-
 
 def render_picking_module(employee_lookup: EmployeeLookup | None) -> None:
     picking_files = st.sidebar.file_uploader(
@@ -1249,13 +1344,14 @@ def render_picking_module(employee_lookup: EmployeeLookup | None) -> None:
     row1[2].metric("总任务单量", f"{result.total_tasks:,}")
     row1[3].metric("拣货人数", f"{result.operator_count:,}")
 
-    row2 = st.columns(4)
+    row2 = st.columns(5)
     row2[0].metric("总实际拣货时长", format_duration(result.total_actual_seconds))
     row2[1].metric("整体任务件比", f"{result.overall_task_piece_ratio:,.2f}")
     row2[2].metric("整体小时单量", f"{result.overall_hourly_orders:,.2f}")
     row2[3].metric("整体小时任务单量", f"{result.overall_hourly_tasks:,.2f}")
+    row2[4].metric("整体小时件效", f"{result.overall_hourly_pieces:,.2f}")
 
-    st.subheader("拣货人员排名")
+    st.subheader("拣货人员排名（按订单量）")
     st.dataframe(
         result.ranking,
         use_container_width=True,
@@ -1268,6 +1364,7 @@ def render_picking_module(employee_lookup: EmployeeLookup | None) -> None:
             "任务件比": st.column_config.NumberColumn(format="%.2f"),
             "人效（小时单量）": st.column_config.NumberColumn(format="%.2f"),
             "小时任务单量": st.column_config.NumberColumn(format="%.2f"),
+            "人效（小时件效）": st.column_config.NumberColumn(format="%.2f"),
         },
     )
 
@@ -1276,6 +1373,7 @@ def render_picking_module(employee_lookup: EmployeeLookup | None) -> None:
 
     duplicate_removed = result.uploaded_row_count - result.deduplicated_row_count
     st.caption(
+        f"排名优先按照实际完成的订单量从高到低；"
         f"上传原始记录 {result.uploaded_row_count:,} 行；"
         f"跨文件重复明细去除 {duplicate_removed:,} 行；"
         f"R区排除 {result.r_area_row_count:,} 行；"
@@ -1298,6 +1396,7 @@ def render_picking_module(employee_lookup: EmployeeLookup | None) -> None:
 - 可一次上传多个周文件；程序先合并，再删除完全重复的明细。
 - **R区不参与本阶段计算**：所属储区等于 `R` 的记录全部排除。
 - 没有任务领取时间或拣货完成时间的记录不参与人效。
+- **考勤组**：从人员主数据匹配，人员表没有考勤组或该字段为空时显示为空。
 - **拣货件量**：实际拣货量合计。
 - **订单量**：订单号去重数量。
 - **任务单量**：任务单号去重数量。
@@ -1305,11 +1404,11 @@ def render_picking_module(employee_lookup: EmployeeLookup | None) -> None:
 - **实际拣货时长**：每个任务从任务领取时间到该任务最晚拣货完成时间；同一人员同一天内的任务时间发生重叠时，重叠部分只计算一次。
 - **人效（小时单量）**：订单量 ÷ 实际拣货小时，单位为订单/小时，越高越好。
 - **小时任务单量**：任务单量 ÷ 实际拣货小时，单位为任务/小时，越高越好。
+- **人效（小时件效）**：拣货件量 ÷ 实际拣货小时，单位为件/小时，越高越好。
+- **排名**：优先按照实际完成的订单量从高到低排名；订单量相同再参考拣货件量和小时单量。
 - 未匹配人员不呈现，也不进入总数。
 """
         )
-
-
 
 def render_packing_module(employee_lookup: EmployeeLookup | None) -> None:
     packing_files = st.sidebar.file_uploader(
@@ -1355,12 +1454,13 @@ def render_packing_module(employee_lookup: EmployeeLookup | None) -> None:
     row1[2].metric("整体件单比", f"{result.overall_piece_order_ratio:,.2f}")
     row1[3].metric("打包人数", f"{result.operator_count:,}")
 
-    row2 = st.columns(3)
+    row2 = st.columns(4)
     row2[0].metric("总有效打包时长", format_duration(result.total_effective_seconds))
     row2[1].metric("整体小时单量", f"{result.overall_hourly_orders:,.2f}")
-    row2[2].metric("当前连续阈值", f"{int(gap_minutes)} 分钟")
+    row2[2].metric("整体小时件效", f"{result.overall_hourly_pieces:,.2f}")
+    row2[3].metric("当前连续阈值", f"{int(gap_minutes)} 分钟")
 
-    st.subheader("打包人员排名")
+    st.subheader("打包人员排名（按订单量）")
     st.dataframe(
         result.ranking,
         use_container_width=True,
@@ -1371,6 +1471,7 @@ def render_packing_module(employee_lookup: EmployeeLookup | None) -> None:
             "订单量": st.column_config.NumberColumn(format="%d"),
             "件单比": st.column_config.NumberColumn(format="%.2f"),
             "人效（小时单量）": st.column_config.NumberColumn(format="%.2f"),
+            "人效（小时件效）": st.column_config.NumberColumn(format="%.2f"),
         },
     )
 
@@ -1379,6 +1480,7 @@ def render_packing_module(employee_lookup: EmployeeLookup | None) -> None:
 
     duplicate_removed = result.uploaded_row_count - result.deduplicated_row_count
     st.caption(
+        f"排名优先按照实际完成的订单量从高到低；"
         f"上传原始记录 {result.uploaded_row_count:,} 行；"
         f"跨文件重复商品明细去除 {duplicate_removed:,} 行；"
         f"无效记录 {result.invalid_row_count:,} 行；"
@@ -1398,12 +1500,15 @@ def render_packing_module(employee_lookup: EmployeeLookup | None) -> None:
         st.markdown(
             f"""
 - 可一次上传多个打包文件；程序先合并，仅删除因文件时间范围重叠而重复出现的商品明细。
+- **考勤组**：从人员主数据匹配，人员表没有考勤组或该字段为空时显示为空。
 - **打包件量**：实际打包件数合计。
 - **订单量**：订单号去重数量，一个订单只计一次。
 - **件单比**：打包件量 ÷ 订单量，用于体现平均每个订单包含的件数。
 - **订单完成时间**：同一订单出现多个打包时间时，使用最晚打包时间。
 - **有效打包时长**：按员工、按自然日排列订单完成时间；相邻订单间隔不超过 **{int(gap_minutes)} 分钟**时，该间隔计入有效打包时长；超过阈值的空档不计。
 - **人效（小时单量）**：订单量 ÷ 有效打包小时，单位为订单/小时，越高越好。
+- **人效（小时件效）**：打包件量 ÷ 有效打包小时，单位为件/小时，越高越好。
+- **排名**：优先按照实际完成的订单量从高到低排名；订单量相同再参考打包件量和小时单量。
 - 原始数据没有开始打包时间，因此有效打包时长是根据相邻订单完成时间推算的工作时长。
 - 未匹配人员不呈现，也不进入总数。
 """
