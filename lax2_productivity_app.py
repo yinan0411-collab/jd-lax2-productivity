@@ -45,6 +45,17 @@ PICKING_COLUMNS = {
     "email": "邮箱",
 }
 
+PACKING_COLUMNS = {
+    "time": "打包时间",
+    "order": "订单号",
+    "package": "包裹编号",
+    "product": "商品编码",
+    "quantity": "实际打包件数",
+    "station": "打包台号",
+    "account": "打包人账号",
+    "employee": "打包人姓名",
+}
+
 
 @dataclass(frozen=True)
 class EmployeeLookup:
@@ -89,6 +100,23 @@ class PickingResult:
     valid_row_count: int
     r_area_row_count: int
     missing_time_row_count: int
+    excluded_unmatched_rows: int
+
+
+@dataclass(frozen=True)
+class PackingResult:
+    ranking: pd.DataFrame
+    file_summary: pd.DataFrame
+    total_pieces: float
+    total_orders: int
+    total_effective_seconds: float
+    overall_piece_order_ratio: float
+    overall_hourly_orders: float
+    operator_count: int
+    uploaded_row_count: int
+    deduplicated_row_count: int
+    valid_row_count: int
+    invalid_row_count: int
     excluded_unmatched_rows: int
 
 
@@ -158,6 +186,14 @@ def choose_picking_operator_id(employee_id: object, email: object) -> str:
     if employee:
         return employee
     return extract_operator_id(email)
+
+
+def choose_packing_operator_id(employee_value: object, account_value: object) -> str:
+    """Use the ID-like value in 打包人姓名 first, then fall back to 打包人账号."""
+    employee = extract_operator_id(employee_value)
+    if employee:
+        return employee
+    return extract_operator_id(account_value)
 
 
 def _add_lookup_value(
@@ -521,7 +557,6 @@ def combine_picking_files(uploaded_files: Sequence[object]) -> tuple[pd.DataFram
     file_summary = pd.DataFrame(summary_rows)
     return combined, file_summary
 
-
 def calculate_picking_productivity(
     combined_df: pd.DataFrame,
     file_summary: pd.DataFrame,
@@ -674,6 +709,216 @@ def calculate_picking_productivity(
     )
 
 
+
+def combine_packing_files(uploaded_files: Sequence[object]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    frames: list[pd.DataFrame] = []
+    summary_rows: list[dict[str, object]] = []
+    required = tuple(PACKING_COLUMNS.values())
+
+    for file_index, uploaded in enumerate(uploaded_files):
+        file_bytes = uploaded.getvalue()
+        file_name = uploaded.name
+        try:
+            frame = read_excel_sheet(file_bytes, file_name, 0, required)
+        except ValueError as exc:
+            raise ValueError(f"文件“{file_name}”缺少必要字段或读取失败：{exc}") from exc
+
+        original_rows = len(frame)
+        # Preserve identical rows within one source file. The occurrence number
+        # removes only repeated copies caused by overlapping uploaded files.
+        frame["_文件内重复序号"] = frame.groupby(
+            list(required), sort=False, dropna=False
+        ).cumcount()
+        frame["_来源文件序号"] = file_index
+        frame["来源文件"] = file_name
+        frames.append(frame)
+        summary_rows.append({"文件名": file_name, "读取行数": original_rows})
+
+    if not frames:
+        raise ValueError("请至少上传一个打包文件。")
+
+    combined = pd.concat(frames, ignore_index=True)
+    file_summary = pd.DataFrame(summary_rows)
+    return combined, file_summary
+
+
+def calculate_gap_based_seconds(
+    order_events: pd.DataFrame,
+    operator_col: str,
+    time_col: str,
+    gap_minutes: int,
+) -> pd.DataFrame:
+    """Estimate active time from adjacent completed-order timestamps by person and day."""
+    max_gap = pd.Timedelta(minutes=gap_minutes)
+    work = order_events[[operator_col, time_col]].dropna().copy()
+    work["工作日期"] = work[time_col].dt.date
+
+    daily_records: list[dict[str, object]] = []
+    for (operator_id, work_date), group in work.groupby(
+        [operator_col, "工作日期"], sort=False
+    ):
+        times = group[time_col].sort_values().drop_duplicates()
+        if len(times) < 2:
+            seconds = 0.0
+        else:
+            gaps = times.diff().dropna()
+            valid_gaps = gaps[(gaps >= pd.Timedelta(0)) & (gaps <= max_gap)]
+            seconds = float(valid_gaps.dt.total_seconds().sum())
+        daily_records.append(
+            {
+                "账号": operator_id,
+                "工作日期": work_date,
+                "秒数": seconds,
+            }
+        )
+
+    if not daily_records:
+        return pd.DataFrame(columns=["账号", "秒数"])
+
+    daily = pd.DataFrame(daily_records)
+    return daily.groupby("账号", as_index=False)["秒数"].sum()
+
+
+def calculate_packing_productivity(
+    combined_df: pd.DataFrame,
+    file_summary: pd.DataFrame,
+    employee_lookup: EmployeeLookup | None,
+    gap_minutes: int,
+) -> PackingResult:
+    required = list(PACKING_COLUMNS.values())
+    missing = [column for column in required if column not in combined_df.columns]
+    if missing:
+        raise ValueError("打包表缺少必要字段：" + "、".join(missing))
+
+    uploaded_row_count = len(combined_df)
+
+    # Remove repeated copies across overlapping files while preserving legitimate
+    # identical rows that already existed inside a single source file.
+    dedupe_key = required.copy()
+    if "_文件内重复序号" in combined_df.columns:
+        dedupe_key.append("_文件内重复序号")
+    work = combined_df.drop_duplicates(subset=dedupe_key, keep="first").copy()
+    deduplicated_row_count = len(work)
+
+    work["打包人账号"] = [
+        choose_packing_operator_id(employee_value, account_value)
+        for employee_value, account_value in zip(
+            work[PACKING_COLUMNS["employee"]],
+            work[PACKING_COLUMNS["account"]],
+        )
+    ]
+    work["实际姓名"] = work["打包人账号"].map(
+        lambda value: match_employee_name(value, employee_lookup)
+    )
+    work["订单号标准值"] = work[PACKING_COLUMNS["order"]].map(clean_identifier)
+    work["打包件量数值"] = pd.to_numeric(
+        work[PACKING_COLUMNS["quantity"]], errors="coerce"
+    )
+    work["打包完成时间"] = pd.to_datetime(
+        work[PACKING_COLUMNS["time"]], errors="coerce"
+    )
+
+    valid_mask = (
+        work["打包人账号"].ne("")
+        & work["订单号标准值"].ne("")
+        & work["打包件量数值"].notna()
+        & work["打包完成时间"].notna()
+        & (work["打包件量数值"] >= 0)
+    )
+    invalid_row_count = int((~valid_mask).sum())
+    work = work.loc[valid_mask].copy()
+
+    excluded_unmatched_rows = int(work["实际姓名"].eq("").sum())
+    valid = work.loc[work["实际姓名"].ne("")].copy()
+    if valid.empty:
+        raise ValueError("排除无效数据和未匹配人员后，没有可计算的打包记录。")
+
+    # One order counts once. When an order has more than one completion timestamp,
+    # use its latest timestamp as the order's completion event.
+    order_events = (
+        valid.groupby(
+            ["打包人账号", "实际姓名", "订单号标准值"], as_index=False
+        )
+        .agg(
+            打包件量=("打包件量数值", "sum"),
+            订单完成时间=("打包完成时间", "max"),
+        )
+    )
+
+    duration = calculate_gap_based_seconds(
+        order_events,
+        "打包人账号",
+        "订单完成时间",
+        gap_minutes,
+    ).rename(columns={"账号": "打包人账号", "秒数": "有效打包秒数"})
+
+    summary = (
+        order_events.groupby(["打包人账号", "实际姓名"], as_index=False)
+        .agg(
+            打包件量=("打包件量", "sum"),
+            订单量=("订单号标准值", "nunique"),
+        )
+    )
+    summary = summary.merge(duration, on="打包人账号", how="left")
+    summary["有效打包秒数"] = summary["有效打包秒数"].fillna(0.0)
+    summary["有效打包小时"] = summary["有效打包秒数"] / 3600
+    summary["件单比"] = np.where(
+        summary["订单量"] > 0,
+        summary["打包件量"] / summary["订单量"],
+        np.nan,
+    )
+    summary["人效（小时单量）"] = np.where(
+        summary["有效打包小时"] > 0,
+        summary["订单量"] / summary["有效打包小时"],
+        np.nan,
+    )
+    summary["有效打包时长"] = summary["有效打包秒数"].map(format_duration)
+
+    summary = summary.sort_values(
+        ["人效（小时单量）", "订单量", "打包件量"],
+        ascending=[False, False, False],
+        na_position="last",
+    ).reset_index(drop=True)
+    summary.insert(0, "排名", np.arange(1, len(summary) + 1))
+
+    ranking = summary[
+        [
+            "排名",
+            "打包人账号",
+            "实际姓名",
+            "打包件量",
+            "订单量",
+            "件单比",
+            "有效打包时长",
+            "人效（小时单量）",
+        ]
+    ].copy()
+
+    total_pieces = float(order_events["打包件量"].sum())
+    total_orders = int(order_events["订单号标准值"].nunique())
+    total_effective_seconds = float(summary["有效打包秒数"].sum())
+    total_hours = total_effective_seconds / 3600
+
+    return PackingResult(
+        ranking=ranking,
+        file_summary=file_summary,
+        total_pieces=total_pieces,
+        total_orders=total_orders,
+        total_effective_seconds=total_effective_seconds,
+        overall_piece_order_ratio=(
+            total_pieces / total_orders if total_orders else float("nan")
+        ),
+        overall_hourly_orders=(
+            total_orders / total_hours if total_hours else float("nan")
+        ),
+        operator_count=len(summary),
+        uploaded_row_count=uploaded_row_count,
+        deduplicated_row_count=deduplicated_row_count,
+        valid_row_count=len(valid),
+        invalid_row_count=invalid_row_count,
+        excluded_unmatched_rows=excluded_unmatched_rows,
+    )
+
 def _excel_formats(workbook):
     return {
         "header": workbook.add_format(
@@ -803,11 +1048,70 @@ def make_picking_excel(result: PickingResult) -> bytes:
     return output.getvalue()
 
 
+
+def make_packing_excel(result: PackingResult, gap_minutes: int) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        result.ranking.to_excel(writer, sheet_name="打包人效排名", index=False)
+        result.file_summary.to_excel(writer, sheet_name="上传文件汇总", index=False)
+        method = pd.DataFrame(
+            {
+                "项目": [
+                    "多文件合并",
+                    "打包件量",
+                    "订单量",
+                    "件单比",
+                    "订单完成时间",
+                    "有效打包时长",
+                    "连续打包阈值",
+                    "人效（小时单量）",
+                    "人员范围",
+                ],
+                "计算口径": [
+                    "允许同时上传多个文件；仅删除因文件时间范围重叠而重复出现的商品明细，单个源文件内的原始行保持不变",
+                    "实际打包件数合计",
+                    "订单号去重数量；一个订单只计一次",
+                    "打包件量 ÷ 订单量",
+                    "同一订单出现多个打包时间时，使用最晚打包时间作为该订单的完成时间",
+                    "按人员和自然日排列订单完成时间；相邻订单间隔不超过阈值时，该间隔计入有效打包时长",
+                    f"当前设置为 {gap_minutes} 分钟；超过阈值的空档不计入有效打包时长",
+                    "订单量 ÷ 有效打包小时（订单/小时，越高越好）",
+                    "仅保留成功匹配人员主数据的员工",
+                ],
+            }
+        )
+        method.to_excel(writer, sheet_name="计算口径", index=False)
+
+        workbook = writer.book
+        fmt = _excel_formats(workbook)
+        sheet = writer.sheets["打包人效排名"]
+        sheet.freeze_panes(1, 0)
+        sheet.autofilter(0, 0, len(result.ranking), len(result.ranking.columns) - 1)
+        sheet.set_row(0, 24, fmt["header"])
+        widths = [8, 22, 22, 14, 12, 12, 18, 18]
+        for col_idx, width in enumerate(widths):
+            sheet.set_column(col_idx, col_idx, width)
+        sheet.set_column(0, 0, 8, fmt["integer"])
+        sheet.set_column(3, 4, 14, fmt["integer"])
+        sheet.set_column(5, 5, 12, fmt["decimal"])
+        sheet.set_column(7, 7, 18, fmt["decimal"])
+
+        file_sheet = writer.sheets["上传文件汇总"]
+        file_sheet.set_row(0, 24, fmt["header"])
+        file_sheet.set_column("A:A", 45)
+        file_sheet.set_column("B:B", 14, fmt["integer"])
+
+        method_sheet = writer.sheets["计算口径"]
+        method_sheet.set_row(0, 24, fmt["header"])
+        method_sheet.set_column("A:A", 22)
+        method_sheet.set_column("B:B", 105)
+    return output.getvalue()
+
 def render_employee_upload() -> EmployeeLookup | None:
     employee_file = st.sidebar.file_uploader(
         "1. 人员主数据",
         type=["xlsx", "xls"],
-        help="验收与拣货共用。支持用户编码/Use ID、ERP和姓名字段。",
+        help="验收、拣货与打包共用。支持用户编码/Use ID、ERP和姓名字段。",
         key="employee_master",
     )
     if employee_file is None:
@@ -1006,14 +1310,113 @@ def render_picking_module(employee_lookup: EmployeeLookup | None) -> None:
         )
 
 
+
+def render_packing_module(employee_lookup: EmployeeLookup | None) -> None:
+    packing_files = st.sidebar.file_uploader(
+        "2. 打包结果文件（可多选）",
+        type=["xlsx", "xls"],
+        accept_multiple_files=True,
+        help="可同时上传多个时间段的文件。程序会自动合并，并去除完全重复的商品明细。",
+        key="packing_data",
+    )
+    gap_minutes = st.sidebar.slider(
+        "连续打包最大间隔（分钟）",
+        min_value=1,
+        max_value=60,
+        value=15,
+        step=1,
+        help="相邻两个订单完成时间的间隔不超过该值时，计入有效打包时长。超过该值视为打包中断。",
+        key="packing_gap_minutes",
+    )
+
+    if not packing_files:
+        st.info("请上传人员主数据和一个或多个打包结果文件。")
+        return
+    if employee_lookup is None:
+        st.info("请先上传人员主数据。未匹配员工不会参与结果。")
+        return
+
+    try:
+        with st.spinner(f"正在合并并计算 {len(packing_files)} 个打包文件……"):
+            combined, file_summary = combine_packing_files(packing_files)
+            result = calculate_packing_productivity(
+                combined,
+                file_summary,
+                employee_lookup,
+                int(gap_minutes),
+            )
+    except Exception as exc:
+        st.error(f"打包数据处理失败：{exc}")
+        return
+
+    row1 = st.columns(4)
+    row1[0].metric("总打包件量", f"{result.total_pieces:,.0f}")
+    row1[1].metric("总订单量", f"{result.total_orders:,}")
+    row1[2].metric("整体件单比", f"{result.overall_piece_order_ratio:,.2f}")
+    row1[3].metric("打包人数", f"{result.operator_count:,}")
+
+    row2 = st.columns(3)
+    row2[0].metric("总有效打包时长", format_duration(result.total_effective_seconds))
+    row2[1].metric("整体小时单量", f"{result.overall_hourly_orders:,.2f}")
+    row2[2].metric("当前连续阈值", f"{int(gap_minutes)} 分钟")
+
+    st.subheader("打包人员排名")
+    st.dataframe(
+        result.ranking,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "排名": st.column_config.NumberColumn(format="%d"),
+            "打包件量": st.column_config.NumberColumn(format="%d"),
+            "订单量": st.column_config.NumberColumn(format="%d"),
+            "件单比": st.column_config.NumberColumn(format="%.2f"),
+            "人效（小时单量）": st.column_config.NumberColumn(format="%.2f"),
+        },
+    )
+
+    with st.expander("查看上传文件汇总"):
+        st.dataframe(result.file_summary, use_container_width=True, hide_index=True)
+
+    duplicate_removed = result.uploaded_row_count - result.deduplicated_row_count
+    st.caption(
+        f"上传原始记录 {result.uploaded_row_count:,} 行；"
+        f"跨文件重复商品明细去除 {duplicate_removed:,} 行；"
+        f"无效记录 {result.invalid_row_count:,} 行；"
+        f"未匹配人员记录 {result.excluded_unmatched_rows:,} 行未呈现；"
+        f"最终有效商品明细 {result.valid_row_count:,} 行。"
+    )
+
+    st.download_button(
+        "下载打包人效结果 Excel",
+        data=make_packing_excel(result, int(gap_minutes)),
+        file_name="打包人效排名结果.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+
+    with st.expander("打包计算口径"):
+        st.markdown(
+            f"""
+- 可一次上传多个打包文件；程序先合并，仅删除因文件时间范围重叠而重复出现的商品明细。
+- **打包件量**：实际打包件数合计。
+- **订单量**：订单号去重数量，一个订单只计一次。
+- **件单比**：打包件量 ÷ 订单量，用于体现平均每个订单包含的件数。
+- **订单完成时间**：同一订单出现多个打包时间时，使用最晚打包时间。
+- **有效打包时长**：按员工、按自然日排列订单完成时间；相邻订单间隔不超过 **{int(gap_minutes)} 分钟**时，该间隔计入有效打包时长；超过阈值的空档不计。
+- **人效（小时单量）**：订单量 ÷ 有效打包小时，单位为订单/小时，越高越好。
+- 原始数据没有开始打包时间，因此有效打包时长是根据相邻订单完成时间推算的工作时长。
+- 未匹配人员不呈现，也不进入总数。
+"""
+        )
+
 def render_app() -> None:
     st.set_page_config(page_title=APP_TITLE, page_icon="📊", layout="wide")
     st.title(APP_TITLE)
-    st.caption("统一人员主数据｜验收与拣货人效分析｜结果可下载为Excel")
+    st.caption("统一人员主数据｜验收、拣货与打包人效分析｜结果可下载为Excel")
 
     with st.sidebar:
         st.header("业务模块")
-        module = st.radio("选择分析环节", ["验收", "拣货"], horizontal=True)
+        module = st.radio("选择分析环节", ["验收", "拣货", "打包"], horizontal=True)
         st.divider()
         st.header("数据上传")
 
@@ -1021,8 +1424,10 @@ def render_app() -> None:
 
     if module == "验收":
         render_acceptance_module(employee_lookup)
-    else:
+    elif module == "拣货":
         render_picking_module(employee_lookup)
+    else:
+        render_packing_module(employee_lookup)
 
 
 if __name__ == "__main__":
