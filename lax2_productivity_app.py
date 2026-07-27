@@ -40,7 +40,6 @@ class EmployeeLookup:
 @dataclass(frozen=True)
 class AcceptanceResult:
     ranking: pd.DataFrame
-    unmatched: pd.DataFrame
     invalid_rows: pd.DataFrame
     total_quantity: float
     total_effective_seconds: float
@@ -320,9 +319,12 @@ def calculate_acceptance_productivity(
     )
     ranking["实际姓名"] = matched_values.map(lambda value: value[0])
     ranking["匹配方式"] = matched_values.map(lambda value: value[1])
-    ranking["匹配状态"] = np.where(
-        ranking["匹配方式"].eq("未匹配"), "未匹配", "已匹配"
-    )
+    # 页面和下载结果只保留能够匹配到实际姓名的员工。
+    ranking = ranking.loc[~ranking["匹配方式"].eq("未匹配")].copy()
+    if ranking.empty:
+        raise ValueError(
+            "人员主数据中没有匹配到任何验收人，请检查用户编码/Use ID或ERP字段。"
+        )
 
     ranking = ranking.sort_values(
         ["小时人效", "验收量"], ascending=[False, False], na_position="last"
@@ -330,6 +332,7 @@ def calculate_acceptance_productivity(
     ranking.insert(0, "排名", np.arange(1, len(ranking) + 1))
     ranking["总有效工作时长"] = ranking["有效秒数"].map(format_duration)
 
+    # 汇总指标与页面排名使用同一批已匹配员工，保证数据完全一致。
     total_quantity = float(ranking["验收量"].sum())
     total_effective_seconds = float(ranking["有效秒数"].sum())
     overall_hourly_productivity = (
@@ -345,18 +348,11 @@ def calculate_acceptance_productivity(
         "验收量",
         "总有效工作时长",
         "小时人效",
-        "匹配状态",
     ]
     ranking_display = ranking[display_columns].copy()
 
-    unmatched = ranking.loc[
-        ranking["匹配状态"].eq("未匹配"),
-        ["验收人账号", "验收量", "总有效工作时长", "小时人效"],
-    ].copy()
-
     return AcceptanceResult(
         ranking=ranking_display,
-        unmatched=unmatched,
         invalid_rows=invalid_rows,
         total_quantity=total_quantity,
         total_effective_seconds=total_effective_seconds,
@@ -392,13 +388,6 @@ def make_excel_output(result: AcceptanceResult, gap_minutes: int) -> bytes:
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         result.ranking.to_excel(writer, sheet_name="验收人效排名", index=False)
 
-        if result.unmatched.empty:
-            pd.DataFrame({"提示": ["所有验收人均已匹配实际姓名"]}).to_excel(
-                writer, sheet_name="未匹配人员", index=False
-            )
-        else:
-            result.unmatched.to_excel(writer, sheet_name="未匹配人员", index=False)
-
         method = pd.DataFrame(
             {
                 "项目": [
@@ -414,7 +403,7 @@ def make_excel_output(result: AcceptanceResult, gap_minutes: int) -> bytes:
                     "按验收人和日期合并重叠时间区间；相邻记录间隔在阈值内视为连续工作",
                     f"当前设置为 {gap_minutes} 分钟；超过该时间的空档不计入有效工作时长",
                     "验收量 ÷ 有效工作小时",
-                    "先匹配用户编码/Use ID，再匹配ERP；账号中的@域名会自动移除",
+                    "先匹配用户编码/Use ID，再匹配ERP；仅保留成功匹配实际姓名的人员",
                     "所有验收人的有效工作时长相加",
                 ],
             }
@@ -435,10 +424,6 @@ def make_excel_output(result: AcceptanceResult, gap_minutes: int) -> bytes:
         integer_format = workbook.add_format({"num_format": "#,##0"})
         decimal_format = workbook.add_format({"num_format": "#,##0.00"})
         text_format = workbook.add_format({"valign": "vcenter"})
-        unmatched_format = workbook.add_format(
-            {"font_color": "#9C0006", "bg_color": "#FFC7CE"}
-        )
-
         ranking_sheet = writer.sheets["验收人效排名"]
         ranking_sheet.freeze_panes(1, 0)
         ranking_sheet.autofilter(0, 0, len(result.ranking), len(result.ranking.columns) - 1)
@@ -449,28 +434,6 @@ def make_excel_output(result: AcceptanceResult, gap_minutes: int) -> bytes:
         ranking_sheet.set_column("D:D", 14, integer_format)
         ranking_sheet.set_column("E:E", 20, text_format)
         ranking_sheet.set_column("F:F", 14, decimal_format)
-        ranking_sheet.set_column("G:G", 12, text_format)
-        if len(result.ranking) > 0:
-            ranking_sheet.conditional_format(
-                1,
-                6,
-                len(result.ranking),
-                6,
-                {
-                    "type": "text",
-                    "criteria": "containing",
-                    "value": "未匹配",
-                    "format": unmatched_format,
-                },
-            )
-
-        unmatched_sheet = writer.sheets["未匹配人员"]
-        unmatched_sheet.freeze_panes(1, 0)
-        unmatched_sheet.set_row(0, 24, header_format)
-        unmatched_sheet.set_column("A:A", 26)
-        unmatched_sheet.set_column("B:B", 14, integer_format)
-        unmatched_sheet.set_column("C:C", 20)
-        unmatched_sheet.set_column("D:D", 14, decimal_format)
 
         method_sheet = writer.sheets["计算口径"]
         method_sheet.set_row(0, 24, header_format)
@@ -535,6 +498,7 @@ def render_app() -> None:
             employee_lookup = None
     else:
         st.info("请先上传人员主数据和验收明细表。人员表更新后可直接重新上传，无需修改程序。")
+        return
 
     if acceptance_file is None:
         return
@@ -581,16 +545,7 @@ def render_app() -> None:
         },
     )
 
-    matched_count = result.operator_count - len(result.unmatched)
-    if result.unmatched.empty:
-        st.success(f"人员姓名匹配完成：{matched_count}/{result.operator_count}。")
-    else:
-        st.warning(
-            f"人员姓名已匹配 {matched_count}/{result.operator_count}；"
-            f"另有 {len(result.unmatched)} 个账号未在人员源数据中找到。"
-        )
-        with st.expander("查看未匹配人员", expanded=True):
-            st.dataframe(result.unmatched, use_container_width=True, hide_index=True)
+    st.caption("排名和汇总指标仅包含已成功匹配实际姓名的验收人员。")
 
     if not result.invalid_rows.empty:
         st.warning(
@@ -616,7 +571,7 @@ def render_app() -> None:
             f"""
 - **验收量**：按验收人汇总有效记录中的验收量。
 - **验收人账号**：自动从账号中去除括号和邮箱域名，例如 `US018958(US018958@jd.com)` 转为 `US018958`。
-- **实际姓名**：先匹配人员表中的用户编码/Use ID，再匹配 ERP。
+- **实际姓名**：先匹配人员表中的用户编码/Use ID，再匹配 ERP；未匹配账号不进入排名和汇总。
 - **有效工作时长**：按验收人和日期合并重叠时间；相邻记录间隔不超过 **{int(gap_minutes)} 分钟**时视为连续工作。
 - **小时人效**：验收量 ÷ 有效工作小时。
 - **总有效工作时长**：所有验收人的有效工作时长相加。
