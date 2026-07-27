@@ -44,7 +44,7 @@ class AcceptanceResult:
     total_order_count: int
     total_system_seconds: float
     total_actual_seconds: float
-    overall_hourly_productivity: float
+    overall_pieces_per_order: float
     overall_hours_per_order: float
     operator_count: int
     included_row_count: int
@@ -389,7 +389,7 @@ def calculate_acceptance_productivity(
             {
                 "验收人账号": operator_id,
                 "实际姓名": employee_name,
-                "验收量": float(group["验收量数值"].sum()),
+                "验收件量": float(group["验收量数值"].sum()),
                 "验收单量": count_unique_orders(group["京东入库单号清洗"]),
                 "系统操作秒数": merge_overlapping_seconds(group),
                 "实际验收秒数": calculate_actual_acceptance_seconds(group),
@@ -399,9 +399,9 @@ def calculate_acceptance_productivity(
     ranking = pd.DataFrame(ranking_rows)
     ranking["系统操作小时"] = ranking["系统操作秒数"] / 3600
     ranking["实际验收小时"] = ranking["实际验收秒数"] / 3600
-    ranking["小时人效"] = np.where(
-        ranking["系统操作小时"] > 0,
-        ranking["验收量"] / ranking["系统操作小时"],
+    ranking["单件比"] = np.where(
+        ranking["验收单量"] > 0,
+        ranking["验收件量"] / ranking["验收单量"],
         np.nan,
     )
     # 按用户指定公式：实际验收时长 ÷ 验收单量，单位为小时/单。
@@ -411,23 +411,25 @@ def calculate_acceptance_productivity(
         np.nan,
     )
 
+    # 人效（小时单量）越低，表示平均每单耗时越短；单件比作为订单结构参考。
     ranking = ranking.sort_values(
-        ["小时人效", "验收量"], ascending=[False, False], na_position="last"
+        ["人效（小时单量）", "验收件量"],
+        ascending=[True, False],
+        na_position="last",
     ).reset_index(drop=True)
     ranking.insert(0, "排名", np.arange(1, len(ranking) + 1))
     ranking["系统操作时长"] = ranking["系统操作秒数"].map(format_duration)
     ranking["实际验收时长"] = ranking["实际验收秒数"].map(format_duration)
 
-    total_quantity = float(ranking["验收量"].sum())
+    total_quantity = float(ranking["验收件量"].sum())
     total_order_count = count_unique_orders(valid["京东入库单号清洗"])
     total_system_seconds = float(ranking["系统操作秒数"].sum())
     total_actual_seconds = float(ranking["实际验收秒数"].sum())
-    total_system_hours = total_system_seconds / 3600
     total_actual_hours = total_actual_seconds / 3600
 
-    overall_hourly_productivity = (
-        total_quantity / total_system_hours
-        if total_system_hours > 0
+    overall_pieces_per_order = (
+        total_quantity / total_order_count
+        if total_order_count > 0
         else float("nan")
     )
     overall_hours_per_order = (
@@ -441,11 +443,11 @@ def calculate_acceptance_productivity(
             "排名",
             "验收人账号",
             "实际姓名",
-            "验收量",
+            "验收件量",
             "验收单量",
+            "单件比",
             "系统操作时长",
             "实际验收时长",
-            "小时人效",
             "人效（小时单量）",
         ]
     ].copy()
@@ -456,7 +458,7 @@ def calculate_acceptance_productivity(
         total_order_count=total_order_count,
         total_system_seconds=total_system_seconds,
         total_actual_seconds=total_actual_seconds,
-        overall_hourly_productivity=overall_hourly_productivity,
+        overall_pieces_per_order=overall_pieces_per_order,
         overall_hours_per_order=overall_hours_per_order,
         operator_count=len(ranking_display),
         included_row_count=len(valid),
@@ -492,11 +494,11 @@ def make_excel_output(result: AcceptanceResult) -> bytes:
         method = pd.DataFrame(
             {
                 "项目": [
-                    "验收量",
+                    "验收件量",
                     "验收单量",
+                    "单件比",
                     "系统操作时长",
                     "实际验收时长",
-                    "小时人效",
                     "人效（小时单量）",
                     "人员匹配",
                     "总验收单量",
@@ -504,11 +506,11 @@ def make_excel_output(result: AcceptanceResult) -> bytes:
                     "整体实际验收时长",
                 ],
                 "计算口径": [
-                    "按验收人汇总计入计算记录中的验收量",
+                    "按验收人汇总计入计算记录中的验收件量",
                     "按验收人对京东入库单号去重计数；同一人员重复出现的同一单号只计1单",
+                    "验收件量 ÷ 验收单量，表示平均每张PI包含多少件",
                     "按验收人、按自然日合并每条系统操作记录的开始至结束时间区间；同一天内重叠时间只计算一次",
                     "同一验收人、同一自然日、同一京东入库单号（PI）取最早开始至最晚结束；再将当天各PI区间去重后相加",
-                    "验收量 ÷ 系统操作小时",
                     "实际验收小时 ÷ 验收单量，单位为小时/单；数值越低表示平均每单耗时越短",
                     "先匹配用户编码/Use ID，再匹配ERP；账号中的@域名自动移除；未匹配人员不呈现且不计入结果",
                     "所有已匹配记录中的京东入库单号全局去重计数",
@@ -544,8 +546,9 @@ def make_excel_output(result: AcceptanceResult) -> bytes:
         ranking_sheet.set_column("B:B", 24, text_format)
         ranking_sheet.set_column("C:C", 22, text_format)
         ranking_sheet.set_column("D:E", 14, integer_format)
-        ranking_sheet.set_column("F:G", 20, text_format)
-        ranking_sheet.set_column("H:I", 18, decimal_format)
+        ranking_sheet.set_column("F:F", 14, decimal_format)
+        ranking_sheet.set_column("G:H", 20, text_format)
+        ranking_sheet.set_column("I:I", 18, decimal_format)
 
         method_sheet = writer.sheets["计算口径"]
         method_sheet.set_row(0, 24, header_format)
@@ -622,26 +625,26 @@ def render_app() -> None:
         return
 
     kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-    kpi1.metric("总验收量", f"{result.total_quantity:,.0f}")
+    kpi1.metric("总验收件量", f"{result.total_quantity:,.0f}")
     kpi2.metric("总验收单量", f"{result.total_order_count:,}")
-    kpi3.metric("系统操作时长", format_duration(result.total_system_seconds))
-    kpi4.metric("实际验收时长", format_duration(result.total_actual_seconds))
+    kpi3.metric("整体单件比", f"{result.overall_pieces_per_order:,.2f}")
+    kpi4.metric("验收人数", f"{result.operator_count:,}")
 
     kpi5, kpi6, kpi7 = st.columns(3)
-    kpi5.metric("整体小时人效", f"{result.overall_hourly_productivity:,.2f}")
-    kpi6.metric("人效（小时单量）", f"{result.overall_hours_per_order:,.4f}")
-    kpi7.metric("验收人数", f"{result.operator_count:,}")
+    kpi5.metric("系统操作时长", format_duration(result.total_system_seconds))
+    kpi6.metric("实际验收时长", format_duration(result.total_actual_seconds))
+    kpi7.metric("人效（小时单量）", f"{result.overall_hours_per_order:,.4f}")
 
-    st.subheader("验收人员小时人效排名")
+    st.subheader("验收人员人效排名")
     st.dataframe(
         result.ranking,
         use_container_width=True,
         hide_index=True,
         column_config={
             "排名": st.column_config.NumberColumn(format="%d"),
-            "验收量": st.column_config.NumberColumn(format="%d"),
+            "验收件量": st.column_config.NumberColumn(format="%d"),
             "验收单量": st.column_config.NumberColumn(format="%d"),
-            "小时人效": st.column_config.NumberColumn(format="%.2f"),
+            "单件比": st.column_config.NumberColumn(format="%.2f"),
             "人效（小时单量）": st.column_config.NumberColumn(format="%.4f"),
         },
     )
@@ -660,13 +663,13 @@ def render_app() -> None:
     with st.expander("计算口径"):
         st.markdown(
             """
-- **验收量**：按验收人汇总计入计算记录中的验收量。
+- **验收件量**：按验收人汇总计入计算记录中的验收件量。
 - **验收单量**：按人员统计唯一的“京东入库单号”；同一人员重复出现的同一单号只计1单。
+- **单件比**：验收件量 ÷ 验收单量，表示平均每张PI包含的件数。
 - **验收人账号**：自动去除括号和邮箱域名，例如 `US018958(US018958@jd.com)` 转为 `US018958`。
 - **实际姓名**：先匹配人员表中的用户编码/Use ID，再匹配 ERP；未匹配人员不呈现且不计入结果。
 - **系统操作时长**：按验收人、按自然日处理每条系统操作记录的开始至结束区间；同一天内重叠部分只计算一次。
 - **实际验收时长**：同一验收人、同一自然日、同一京东入库单号（PI），取该PI最早开始验收时间至最晚验收时间；再将当天不同PI之间的重叠区间去重，最后把各天时长相加。
-- **小时人效**：验收量 ÷ 系统操作小时。
 - **人效（小时单量）**：实际验收小时 ÷ 验收单量，单位为小时/单；数值越低，表示平均每单耗时越短。
 - **总验收单量**：所有已匹配记录中的京东入库单号全局去重计数。
 - **总系统操作时长/实际验收时长**：分别将所有已匹配验收人的个人时长相加。
