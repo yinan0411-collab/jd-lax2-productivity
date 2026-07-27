@@ -57,6 +57,14 @@ PACKING_COLUMNS = {
     "employee": "打包人姓名",
 }
 
+PICKING_RANK_GROUP_ORDER = ["1st Shift", "2nd Shift", "其他组"]
+PACKING_RANK_GROUP_ORDER = [
+    "出库-打包-Babylist",
+    "出库-打包-Mix",
+    "出库-Trafilea B2B",
+    "其他组",
+]
+
 
 @dataclass(frozen=True)
 class EmployeeLookup:
@@ -165,6 +173,44 @@ def clean_identifier(value: object) -> str:
     if text.casefold() in {"nan", "none", "nat"}:
         return ""
     return text
+
+
+def classify_picking_rank_group(attendance_group: object) -> str:
+    """Collapse picking attendance groups into 1st Shift, 2nd Shift, or 其他组."""
+    text = canonical_key(attendance_group)
+    if "1st shift" in text:
+        return "1st Shift"
+    if "2nd shift" in text:
+        return "2nd Shift"
+    return "其他组"
+
+
+def classify_packing_rank_group(attendance_group: object) -> str:
+    """Keep the three designated packing groups; place every other value in 其他组."""
+    text = canonical_key(attendance_group)
+    target_map = {canonical_key(group): group for group in PACKING_RANK_GROUP_ORDER[:-1]}
+    return target_map.get(text, "其他组")
+
+
+def apply_group_ranking(
+    summary: pd.DataFrame,
+    group_col: str,
+    group_order: Sequence[str],
+    sort_columns: Sequence[str],
+    ascending: Sequence[bool],
+) -> pd.DataFrame:
+    """Sort employees by configured group order and reset ranking within each group."""
+    ranked = summary.copy()
+    ranked["_排名组顺序"] = pd.Categorical(
+        ranked[group_col], categories=list(group_order), ordered=True
+    )
+    ranked = ranked.sort_values(
+        ["_排名组顺序", *sort_columns],
+        ascending=[True, *ascending],
+        na_position="last",
+    ).reset_index(drop=True)
+    ranked["组内排名"] = ranked.groupby(group_col, sort=False).cumcount() + 1
+    return ranked.drop(columns=["_排名组顺序"])
 
 
 def extract_operator_id(value: object) -> str:
@@ -725,17 +771,20 @@ def calculate_picking_productivity(
         np.nan,
     )
     summary["实际拣货时长"] = summary["实际拣货秒数"].map(format_duration)
+    summary["排名组"] = summary["考勤组"].map(classify_picking_rank_group)
 
-    summary = summary.sort_values(
-        ["订单量", "拣货件量", "人效（小时单量）"],
+    summary = apply_group_ranking(
+        summary,
+        group_col="排名组",
+        group_order=PICKING_RANK_GROUP_ORDER,
+        sort_columns=["订单量", "拣货件量", "人效（小时单量）"],
         ascending=[False, False, False],
-        na_position="last",
-    ).reset_index(drop=True)
-    summary.insert(0, "排名", np.arange(1, len(summary) + 1))
+    )
 
     ranking = summary[
         [
-            "排名",
+            "排名组",
+            "组内排名",
             "拣货人账号",
             "实际姓名",
             "考勤组",
@@ -949,17 +998,20 @@ def calculate_packing_productivity(
         np.nan,
     )
     summary["有效打包时长"] = summary["有效打包秒数"].map(format_duration)
+    summary["排名组"] = summary["考勤组"].map(classify_packing_rank_group)
 
-    summary = summary.sort_values(
-        ["订单量", "打包件量", "人效（小时单量）"],
+    summary = apply_group_ranking(
+        summary,
+        group_col="排名组",
+        group_order=PACKING_RANK_GROUP_ORDER,
+        sort_columns=["订单量", "打包件量", "人效（小时单量）"],
         ascending=[False, False, False],
-        na_position="last",
-    ).reset_index(drop=True)
-    summary.insert(0, "排名", np.arange(1, len(summary) + 1))
+    )
 
     ranking = summary[
         [
-            "排名",
+            "排名组",
+            "组内排名",
             "打包人账号",
             "实际姓名",
             "考勤组",
@@ -1082,6 +1134,7 @@ def make_picking_excel(result: PickingResult) -> bytes:
                     "R区",
                     "多文件合并",
                     "考勤组",
+                    "排名分组",
                     "拣货件量",
                     "订单量",
                     "任务单量",
@@ -1097,6 +1150,7 @@ def make_picking_excel(result: PickingResult) -> bytes:
                     "所属储区等于R的记录全部排除，本阶段不参与计算",
                     "允许同时上传多个周文件；完全重复的明细仅保留一条",
                     "从人员主数据中的考勤组字段匹配；源数据为空时结果保持为空",
+                    "考勤组名称包含1st Shift的归入1st Shift，包含2nd Shift的归入2nd Shift，其余全部归入其他组",
                     "实际拣货量合计",
                     "订单号去重数量",
                     "任务单号去重数量",
@@ -1105,7 +1159,7 @@ def make_picking_excel(result: PickingResult) -> bytes:
                     "订单量 ÷ 实际拣货小时（订单/小时，越高越好）",
                     "任务单量 ÷ 实际拣货小时（任务/小时，越高越好）",
                     "拣货件量 ÷ 实际拣货小时（件/小时，越高越好）",
-                    "优先按照实际完成的订单量从高到低排名；订单量相同时依次参考拣货件量和小时单量",
+                    "先按1st Shift、2nd Shift、其他组分组；各组内按照实际完成的订单量从高到低排名，订单量相同时依次参考拣货件量和小时单量",
                     "仅保留有任务领取时间且成功匹配人员主数据的员工",
                 ],
             }
@@ -1118,13 +1172,13 @@ def make_picking_excel(result: PickingResult) -> bytes:
         sheet.freeze_panes(1, 0)
         sheet.autofilter(0, 0, len(result.ranking), len(result.ranking.columns) - 1)
         sheet.set_row(0, 24, fmt["header"])
-        widths = [8, 22, 22, 18, 14, 12, 12, 12, 18, 18, 16, 18]
+        widths = [16, 10, 22, 22, 22, 14, 12, 12, 12, 18, 18, 16, 18]
         for col_idx, width in enumerate(widths):
             sheet.set_column(col_idx, col_idx, width)
-        sheet.set_column(0, 0, 8, fmt["integer"])
-        sheet.set_column(4, 6, 14, fmt["integer"])
-        sheet.set_column(7, 7, 12, fmt["decimal"])
-        sheet.set_column(9, 11, 18, fmt["decimal"])
+        sheet.set_column(1, 1, 10, fmt["integer"])
+        sheet.set_column(5, 7, 14, fmt["integer"])
+        sheet.set_column(8, 8, 12, fmt["decimal"])
+        sheet.set_column(10, 12, 18, fmt["decimal"])
 
         file_sheet = writer.sheets["上传文件汇总"]
         file_sheet.set_row(0, 24, fmt["header"])
@@ -1147,6 +1201,7 @@ def make_packing_excel(result: PackingResult, gap_minutes: int) -> bytes:
                 "项目": [
                     "多文件合并",
                     "考勤组",
+                    "排名分组",
                     "打包件量",
                     "订单量",
                     "件单比",
@@ -1161,6 +1216,7 @@ def make_packing_excel(result: PackingResult, gap_minutes: int) -> bytes:
                 "计算口径": [
                     "允许同时上传多个文件；仅删除因文件时间范围重叠而重复出现的商品明细，单个源文件内的原始行保持不变",
                     "从人员主数据中的考勤组字段匹配；源数据为空时结果保持为空",
+                    "仅保留出库-打包-Babylist、出库-打包-Mix、出库-Trafilea B2B三个指定组，其余考勤组全部归入其他组",
                     "实际打包件数合计",
                     "订单号去重数量；一个订单只计一次",
                     "打包件量 ÷ 订单量",
@@ -1169,7 +1225,7 @@ def make_packing_excel(result: PackingResult, gap_minutes: int) -> bytes:
                     f"当前设置为 {gap_minutes} 分钟；超过阈值的空档不计入有效打包时长",
                     "订单量 ÷ 有效打包小时（订单/小时，越高越好）",
                     "打包件量 ÷ 有效打包小时（件/小时，越高越好）",
-                    "优先按照实际完成的订单量从高到低排名；订单量相同时依次参考打包件量和小时单量",
+                    "先按出库-打包-Babylist、出库-打包-Mix、出库-Trafilea B2B、其他组分组；各组内按照实际完成的订单量从高到低排名，订单量相同时依次参考打包件量和小时单量",
                     "仅保留成功匹配人员主数据的员工",
                 ],
             }
@@ -1182,13 +1238,13 @@ def make_packing_excel(result: PackingResult, gap_minutes: int) -> bytes:
         sheet.freeze_panes(1, 0)
         sheet.autofilter(0, 0, len(result.ranking), len(result.ranking.columns) - 1)
         sheet.set_row(0, 24, fmt["header"])
-        widths = [8, 22, 22, 18, 14, 12, 12, 18, 18, 18]
+        widths = [22, 10, 22, 22, 22, 14, 12, 12, 18, 18, 18]
         for col_idx, width in enumerate(widths):
             sheet.set_column(col_idx, col_idx, width)
-        sheet.set_column(0, 0, 8, fmt["integer"])
-        sheet.set_column(4, 5, 14, fmt["integer"])
-        sheet.set_column(6, 6, 12, fmt["decimal"])
-        sheet.set_column(8, 9, 18, fmt["decimal"])
+        sheet.set_column(1, 1, 10, fmt["integer"])
+        sheet.set_column(5, 6, 14, fmt["integer"])
+        sheet.set_column(7, 7, 12, fmt["decimal"])
+        sheet.set_column(9, 10, 18, fmt["decimal"])
 
         file_sheet = writer.sheets["上传文件汇总"]
         file_sheet.set_row(0, 24, fmt["header"])
@@ -1351,29 +1407,37 @@ def render_picking_module(employee_lookup: EmployeeLookup | None) -> None:
     row2[3].metric("整体小时任务单量", f"{result.overall_hourly_tasks:,.2f}")
     row2[4].metric("整体小时件效", f"{result.overall_hourly_pieces:,.2f}")
 
-    st.subheader("拣货人员排名（按订单量）")
-    st.dataframe(
-        result.ranking,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "排名": st.column_config.NumberColumn(format="%d"),
-            "拣货件量": st.column_config.NumberColumn(format="%d"),
-            "订单量": st.column_config.NumberColumn(format="%d"),
-            "任务单量": st.column_config.NumberColumn(format="%d"),
-            "任务件比": st.column_config.NumberColumn(format="%.2f"),
-            "人效（小时单量）": st.column_config.NumberColumn(format="%.2f"),
-            "小时任务单量": st.column_config.NumberColumn(format="%.2f"),
-            "人效（小时件效）": st.column_config.NumberColumn(format="%.2f"),
-        },
-    )
+    st.subheader("拣货人员分组排名（各组按订单量）")
+    picking_column_config = {
+        "组内排名": st.column_config.NumberColumn(format="%d"),
+        "拣货件量": st.column_config.NumberColumn(format="%d"),
+        "订单量": st.column_config.NumberColumn(format="%d"),
+        "任务单量": st.column_config.NumberColumn(format="%d"),
+        "任务件比": st.column_config.NumberColumn(format="%.2f"),
+        "人效（小时单量）": st.column_config.NumberColumn(format="%.2f"),
+        "小时任务单量": st.column_config.NumberColumn(format="%.2f"),
+        "人效（小时件效）": st.column_config.NumberColumn(format="%.2f"),
+    }
+    for group_name in PICKING_RANK_GROUP_ORDER:
+        group_ranking = result.ranking.loc[
+            result.ranking["排名组"].eq(group_name)
+        ].drop(columns=["排名组"])
+        if group_ranking.empty:
+            continue
+        st.markdown(f"#### {group_name}（{len(group_ranking)}人）")
+        st.dataframe(
+            group_ranking,
+            use_container_width=True,
+            hide_index=True,
+            column_config=picking_column_config,
+        )
 
     with st.expander("查看上传文件汇总"):
         st.dataframe(result.file_summary, use_container_width=True, hide_index=True)
 
     duplicate_removed = result.uploaded_row_count - result.deduplicated_row_count
     st.caption(
-        f"排名优先按照实际完成的订单量从高到低；"
+        f"按1st Shift、2nd Shift、其他组分别排名，各组内优先按照实际完成的订单量从高到低；"
         f"上传原始记录 {result.uploaded_row_count:,} 行；"
         f"跨文件重复明细去除 {duplicate_removed:,} 行；"
         f"R区排除 {result.r_area_row_count:,} 行；"
@@ -1397,6 +1461,7 @@ def render_picking_module(employee_lookup: EmployeeLookup | None) -> None:
 - **R区不参与本阶段计算**：所属储区等于 `R` 的记录全部排除。
 - 没有任务领取时间或拣货完成时间的记录不参与人效。
 - **考勤组**：从人员主数据匹配，人员表没有考勤组或该字段为空时显示为空。
+- **排名分组**：考勤组名称包含 `1st Shift` 的归入 **1st Shift**，包含 `2nd Shift` 的归入 **2nd Shift**，其余全部归入 **其他组**。
 - **拣货件量**：实际拣货量合计。
 - **订单量**：订单号去重数量。
 - **任务单量**：任务单号去重数量。
@@ -1405,7 +1470,7 @@ def render_picking_module(employee_lookup: EmployeeLookup | None) -> None:
 - **人效（小时单量）**：订单量 ÷ 实际拣货小时，单位为订单/小时，越高越好。
 - **小时任务单量**：任务单量 ÷ 实际拣货小时，单位为任务/小时，越高越好。
 - **人效（小时件效）**：拣货件量 ÷ 实际拣货小时，单位为件/小时，越高越好。
-- **排名**：优先按照实际完成的订单量从高到低排名；订单量相同再参考拣货件量和小时单量。
+- **排名**：三个排名组分别独立排名；每组内优先按照实际完成的订单量从高到低，订单量相同再参考拣货件量和小时单量。
 - 未匹配人员不呈现，也不进入总数。
 """
         )
@@ -1460,27 +1525,35 @@ def render_packing_module(employee_lookup: EmployeeLookup | None) -> None:
     row2[2].metric("整体小时件效", f"{result.overall_hourly_pieces:,.2f}")
     row2[3].metric("当前连续阈值", f"{int(gap_minutes)} 分钟")
 
-    st.subheader("打包人员排名（按订单量）")
-    st.dataframe(
-        result.ranking,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "排名": st.column_config.NumberColumn(format="%d"),
-            "打包件量": st.column_config.NumberColumn(format="%d"),
-            "订单量": st.column_config.NumberColumn(format="%d"),
-            "件单比": st.column_config.NumberColumn(format="%.2f"),
-            "人效（小时单量）": st.column_config.NumberColumn(format="%.2f"),
-            "人效（小时件效）": st.column_config.NumberColumn(format="%.2f"),
-        },
-    )
+    st.subheader("打包人员分组排名（各组按订单量）")
+    packing_column_config = {
+        "组内排名": st.column_config.NumberColumn(format="%d"),
+        "打包件量": st.column_config.NumberColumn(format="%d"),
+        "订单量": st.column_config.NumberColumn(format="%d"),
+        "件单比": st.column_config.NumberColumn(format="%.2f"),
+        "人效（小时单量）": st.column_config.NumberColumn(format="%.2f"),
+        "人效（小时件效）": st.column_config.NumberColumn(format="%.2f"),
+    }
+    for group_name in PACKING_RANK_GROUP_ORDER:
+        group_ranking = result.ranking.loc[
+            result.ranking["排名组"].eq(group_name)
+        ].drop(columns=["排名组"])
+        if group_ranking.empty:
+            continue
+        st.markdown(f"#### {group_name}（{len(group_ranking)}人）")
+        st.dataframe(
+            group_ranking,
+            use_container_width=True,
+            hide_index=True,
+            column_config=packing_column_config,
+        )
 
     with st.expander("查看上传文件汇总"):
         st.dataframe(result.file_summary, use_container_width=True, hide_index=True)
 
     duplicate_removed = result.uploaded_row_count - result.deduplicated_row_count
     st.caption(
-        f"排名优先按照实际完成的订单量从高到低；"
+        f"按三个指定打包组和其他组分别排名，各组内优先按照实际完成的订单量从高到低；"
         f"上传原始记录 {result.uploaded_row_count:,} 行；"
         f"跨文件重复商品明细去除 {duplicate_removed:,} 行；"
         f"无效记录 {result.invalid_row_count:,} 行；"
@@ -1501,6 +1574,7 @@ def render_packing_module(employee_lookup: EmployeeLookup | None) -> None:
             f"""
 - 可一次上传多个打包文件；程序先合并，仅删除因文件时间范围重叠而重复出现的商品明细。
 - **考勤组**：从人员主数据匹配，人员表没有考勤组或该字段为空时显示为空。
+- **排名分组**：`出库-打包-Babylist`、`出库-打包-Mix`、`出库-Trafilea B2B` 分别独立成组，其他考勤组全部归入 **其他组**。
 - **打包件量**：实际打包件数合计。
 - **订单量**：订单号去重数量，一个订单只计一次。
 - **件单比**：打包件量 ÷ 订单量，用于体现平均每个订单包含的件数。
@@ -1508,7 +1582,7 @@ def render_packing_module(employee_lookup: EmployeeLookup | None) -> None:
 - **有效打包时长**：按员工、按自然日排列订单完成时间；相邻订单间隔不超过 **{int(gap_minutes)} 分钟**时，该间隔计入有效打包时长；超过阈值的空档不计。
 - **人效（小时单量）**：订单量 ÷ 有效打包小时，单位为订单/小时，越高越好。
 - **人效（小时件效）**：打包件量 ÷ 有效打包小时，单位为件/小时，越高越好。
-- **排名**：优先按照实际完成的订单量从高到低排名；订单量相同再参考打包件量和小时单量。
+- **排名**：四个排名组分别独立排名；每组内优先按照实际完成的订单量从高到低，订单量相同再参考打包件量和小时单量。
 - 原始数据没有开始打包时间，因此有效打包时长是根据相邻订单完成时间推算的工作时长。
 - 未匹配人员不呈现，也不进入总数。
 """
