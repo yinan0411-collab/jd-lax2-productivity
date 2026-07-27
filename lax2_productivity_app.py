@@ -3,7 +3,6 @@ from __future__ import annotations
 import io
 import re
 from dataclasses import dataclass
-from datetime import timedelta
 from typing import Iterable
 
 import numpy as np
@@ -45,7 +44,7 @@ class AcceptanceResult:
     total_effective_seconds: float
     overall_hourly_productivity: float
     operator_count: int
-    valid_row_count: int
+    included_row_count: int
     total_row_count: int
 
 
@@ -81,12 +80,11 @@ def clean_name(value: object) -> str:
 
 
 def extract_operator_id(value: object) -> str:
-    """Convert operator text to an account ID suitable for employee lookup.
+    """将验收人字段转换为可用于人员主数据匹配的账号。
 
-    Examples:
+    示例：
     US018958(US018958@jd.com) -> US018958
     fang.yang@jd.com          -> fang.yang
-    huiyingsun369@gmail.com   -> huiyingsun369
     """
     if value is None or pd.isna(value):
         return ""
@@ -130,12 +128,10 @@ def build_employee_lookup(employee_df: pd.DataFrame) -> EmployeeLookup:
 
     if name_col is None:
         raise ValueError(
-            "人员源数据中未找到姓名列。支持的列名包括：姓名、员工姓名、Name、Employee Name。"
+            "人员源数据中未找到姓名列。支持：姓名、员工姓名、Name、Employee Name。"
         )
     if user_id_col is None and erp_col is None:
-        raise ValueError(
-            "人员源数据中未找到用户编码/Use ID或ERP列，无法匹配人员。"
-        )
+        raise ValueError("人员源数据中未找到用户编码/Use ID或ERP列。")
 
     exact_user_id: dict[str, str] = {}
     exact_erp: dict[str, str] = {}
@@ -192,47 +188,19 @@ def build_employee_lookup(employee_df: pd.DataFrame) -> EmployeeLookup:
     )
 
 
-def match_employee(operator_id: str, lookup: EmployeeLookup | None) -> tuple[str, str]:
-    if lookup is None:
-        return "未上传人员表", "未匹配"
-
+def match_employee(operator_id: str, lookup: EmployeeLookup) -> str:
     exact = canonical_key(operator_id)
     compact = compact_key(operator_id)
 
     if exact in lookup.exact_user_id:
-        return lookup.exact_user_id[exact], "用户编码"
+        return lookup.exact_user_id[exact]
     if exact in lookup.exact_erp:
-        return lookup.exact_erp[exact], "ERP"
+        return lookup.exact_erp[exact]
     if compact and compact in lookup.normalized_user_id:
-        return lookup.normalized_user_id[compact], "用户编码（标准化）"
+        return lookup.normalized_user_id[compact]
     if compact and compact in lookup.normalized_erp:
-        return lookup.normalized_erp[compact], "ERP（标准化）"
-    return "未匹配", "未匹配"
-
-
-def merge_intervals_effective_seconds(
-    starts: pd.Series,
-    ends: pd.Series,
-    gap_minutes: int,
-) -> float:
-    intervals = sorted(zip(starts.tolist(), ends.tolist()), key=lambda item: item[0])
-    if not intervals:
-        return 0.0
-
-    allowed_gap = pd.Timedelta(minutes=gap_minutes)
-    current_start, current_end = intervals[0]
-    total_seconds = 0.0
-
-    for next_start, next_end in intervals[1:]:
-        if next_start <= current_end + allowed_gap:
-            if next_end > current_end:
-                current_end = next_end
-        else:
-            total_seconds += (current_end - current_start).total_seconds()
-            current_start, current_end = next_start, next_end
-
-    total_seconds += (current_end - current_start).total_seconds()
-    return max(total_seconds, 0.0)
+        return lookup.normalized_erp[compact]
+    return ""
 
 
 def format_duration(total_seconds: float) -> str:
@@ -244,8 +212,7 @@ def format_duration(total_seconds: float) -> str:
 
 def calculate_acceptance_productivity(
     acceptance_df: pd.DataFrame,
-    employee_lookup: EmployeeLookup | None,
-    gap_minutes: int = 5,
+    employee_lookup: EmployeeLookup,
 ) -> AcceptanceResult:
     missing_columns = [
         column for column in ACCEPTANCE_COLUMNS.values() if column not in acceptance_df.columns
@@ -256,6 +223,9 @@ def calculate_acceptance_productivity(
     work = acceptance_df[list(ACCEPTANCE_COLUMNS.values())].copy()
     work["原始行号"] = np.arange(2, len(work) + 2)
     work["验收人账号"] = work[ACCEPTANCE_COLUMNS["operator"]].map(extract_operator_id)
+    work["实际姓名"] = work["验收人账号"].map(
+        lambda value: match_employee(value, employee_lookup)
+    )
     work["验收量数值"] = pd.to_numeric(
         work[ACCEPTANCE_COLUMNS["quantity"]], errors="coerce"
     )
@@ -268,6 +238,7 @@ def calculate_acceptance_productivity(
 
     valid_mask = (
         work["验收人账号"].ne("")
+        & work["实际姓名"].ne("")
         & work["验收量数值"].notna()
         & work["开始时间"].notna()
         & work["结束时间"].notna()
@@ -278,35 +249,19 @@ def calculate_acceptance_productivity(
     valid = work.loc[valid_mask].copy()
 
     if valid.empty:
-        raise ValueError("没有可用于计算的人效记录，请检查验收人、验收量和时间字段。")
+        raise ValueError("没有可用于计算的人效记录，请检查人员表、验收量和时间字段。")
 
-    valid["工作日期"] = valid["开始时间"].dt.date
+    # 用户指定口径：每一行的最后验收时间减去开始验收时间，再按人员直接相加。
+    valid["有效秒数"] = (valid["结束时间"] - valid["开始时间"]).dt.total_seconds()
 
-    quantity_summary = (
-        valid.groupby("验收人账号", as_index=False)
-        .agg(验收量=("验收量数值", "sum"), 有效记录数=("验收量数值", "size"))
-    )
-
-    duration_records: list[dict[str, object]] = []
-    for (operator_id, work_date), group in valid.groupby(
-        ["验收人账号", "工作日期"], sort=False
-    ):
-        duration_records.append(
-            {
-                "验收人账号": operator_id,
-                "工作日期": work_date,
-                "有效秒数": merge_intervals_effective_seconds(
-                    group["开始时间"], group["结束时间"], gap_minutes
-                ),
-            }
+    ranking = (
+        valid.groupby(["验收人账号", "实际姓名"], as_index=False)
+        .agg(
+            验收量=("验收量数值", "sum"),
+            有效秒数=("有效秒数", "sum"),
         )
-
-    daily_duration = pd.DataFrame(duration_records)
-    duration_summary = (
-        daily_duration.groupby("验收人账号", as_index=False)["有效秒数"].sum()
     )
 
-    ranking = quantity_summary.merge(duration_summary, on="验收人账号", how="left")
     ranking["有效工作小时"] = ranking["有效秒数"] / 3600
     ranking["小时人效"] = np.where(
         ranking["有效工作小时"] > 0,
@@ -314,25 +269,12 @@ def calculate_acceptance_productivity(
         np.nan,
     )
 
-    matched_values = ranking["验收人账号"].apply(
-        lambda value: match_employee(value, employee_lookup)
-    )
-    ranking["实际姓名"] = matched_values.map(lambda value: value[0])
-    ranking["匹配方式"] = matched_values.map(lambda value: value[1])
-    # 页面和下载结果只保留能够匹配到实际姓名的员工。
-    ranking = ranking.loc[~ranking["匹配方式"].eq("未匹配")].copy()
-    if ranking.empty:
-        raise ValueError(
-            "人员主数据中没有匹配到任何验收人，请检查用户编码/Use ID或ERP字段。"
-        )
-
     ranking = ranking.sort_values(
         ["小时人效", "验收量"], ascending=[False, False], na_position="last"
     ).reset_index(drop=True)
     ranking.insert(0, "排名", np.arange(1, len(ranking) + 1))
     ranking["总有效工作时长"] = ranking["有效秒数"].map(format_duration)
 
-    # 汇总指标与页面排名使用同一批已匹配员工，保证数据完全一致。
     total_quantity = float(ranking["验收量"].sum())
     total_effective_seconds = float(ranking["有效秒数"].sum())
     overall_hourly_productivity = (
@@ -341,15 +283,16 @@ def calculate_acceptance_productivity(
         else float("nan")
     )
 
-    display_columns = [
-        "排名",
-        "验收人账号",
-        "实际姓名",
-        "验收量",
-        "总有效工作时长",
-        "小时人效",
-    ]
-    ranking_display = ranking[display_columns].copy()
+    ranking_display = ranking[
+        [
+            "排名",
+            "验收人账号",
+            "实际姓名",
+            "验收量",
+            "总有效工作时长",
+            "小时人效",
+        ]
+    ].copy()
 
     return AcceptanceResult(
         ranking=ranking_display,
@@ -357,8 +300,8 @@ def calculate_acceptance_productivity(
         total_quantity=total_quantity,
         total_effective_seconds=total_effective_seconds,
         overall_hourly_productivity=overall_hourly_productivity,
-        operator_count=len(ranking),
-        valid_row_count=len(valid),
+        operator_count=len(ranking_display),
+        included_row_count=len(valid),
         total_row_count=len(work),
     )
 
@@ -383,7 +326,7 @@ def read_excel_sheet(
     )
 
 
-def make_excel_output(result: AcceptanceResult, gap_minutes: int) -> bytes:
+def make_excel_output(result: AcceptanceResult) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         result.ranking.to_excel(writer, sheet_name="验收人效排名", index=False)
@@ -392,19 +335,19 @@ def make_excel_output(result: AcceptanceResult, gap_minutes: int) -> bytes:
             {
                 "项目": [
                     "验收量",
-                    "有效工作时长",
-                    "连续工作间隔",
+                    "单行有效工作时长",
+                    "个人总有效工作时长",
                     "小时人效",
                     "人员匹配",
-                    "总有效工作时长",
+                    "整体总有效工作时长",
                 ],
                 "计算口径": [
-                    "按验收人汇总有效记录中的验收量",
-                    "按验收人和日期合并重叠时间区间；相邻记录间隔在阈值内视为连续工作",
-                    f"当前设置为 {gap_minutes} 分钟；超过该时间的空档不计入有效工作时长",
+                    "按验收人汇总计入计算记录中的验收量",
+                    "每一行均按最后验收时间减去开始验收时间计算",
+                    "将该验收人的所有单行有效工作时长直接相加，不合并重叠时间，也不判断记录间隔",
                     "验收量 ÷ 有效工作小时",
-                    "先匹配用户编码/Use ID，再匹配ERP；仅保留成功匹配实际姓名的人员",
-                    "所有验收人的有效工作时长相加",
+                    "先匹配用户编码/Use ID，再匹配ERP；账号中的@域名自动移除；未匹配人员不呈现且不计入结果",
+                    "所有已匹配验收人的个人总有效工作时长相加",
                 ],
             }
         )
@@ -424,9 +367,12 @@ def make_excel_output(result: AcceptanceResult, gap_minutes: int) -> bytes:
         integer_format = workbook.add_format({"num_format": "#,##0"})
         decimal_format = workbook.add_format({"num_format": "#,##0.00"})
         text_format = workbook.add_format({"valign": "vcenter"})
+
         ranking_sheet = writer.sheets["验收人效排名"]
         ranking_sheet.freeze_panes(1, 0)
-        ranking_sheet.autofilter(0, 0, len(result.ranking), len(result.ranking.columns) - 1)
+        ranking_sheet.autofilter(
+            0, 0, len(result.ranking), len(result.ranking.columns) - 1
+        )
         ranking_sheet.set_row(0, 24, header_format)
         ranking_sheet.set_column("A:A", 8, integer_format)
         ranking_sheet.set_column("B:B", 24, text_format)
@@ -437,9 +383,9 @@ def make_excel_output(result: AcceptanceResult, gap_minutes: int) -> bytes:
 
         method_sheet = writer.sheets["计算口径"]
         method_sheet.set_row(0, 24, header_format)
-        method_sheet.set_column("A:A", 20)
-        method_sheet.set_column("B:B", 90)
-        method_sheet.set_default_row(28)
+        method_sheet.set_column("A:A", 22)
+        method_sheet.set_column("B:B", 100)
+        method_sheet.set_default_row(30)
 
     return output.getvalue()
 
@@ -462,48 +408,31 @@ def render_app() -> None:
             type=["xlsx", "xls"],
             key="acceptance_data",
         )
-        gap_minutes = st.number_input(
-            "连续工作最大间隔（分钟）",
-            min_value=0,
-            max_value=60,
-            value=5,
-            step=1,
-            help="相邻记录间隔不超过该值，视为同一段连续工作；超过的空档不计入有效工作时长。",
-        )
 
         st.divider()
         st.markdown("**后续模块**")
         st.caption("上架、复核、打包、大波次拣货、普通拣货将继续使用同一张人员主数据匹配姓名。")
 
-    employee_lookup: EmployeeLookup | None = None
-
-    if employee_file is not None:
-        try:
-            employee_bytes = employee_file.getvalue()
-            employee_sheets = get_sheet_names(employee_bytes)
-            employee_sheet = st.sidebar.selectbox(
-                "人员表工作表",
-                employee_sheets,
-                key="employee_sheet",
-            )
-            employee_df = read_excel_sheet(employee_bytes, employee_sheet)
-            employee_lookup = build_employee_lookup(employee_df)
-            st.sidebar.success(f"人员源数据已读取：{employee_lookup.source_rows:,} 行")
-            if employee_lookup.duplicate_keys:
-                st.sidebar.warning(
-                    f"发现 {len(employee_lookup.duplicate_keys)} 个重复匹配键，程序保留首次出现的姓名。"
-                )
-        except Exception as exc:
-            st.sidebar.error(f"人员表读取失败：{exc}")
-            employee_lookup = None
-    else:
-        st.info("请先上传人员主数据和验收明细表。人员表更新后可直接重新上传，无需修改程序。")
-        return
-
-    if acceptance_file is None:
+    if employee_file is None or acceptance_file is None:
+        st.info("请上传人员主数据和验收明细表。")
         return
 
     try:
+        employee_bytes = employee_file.getvalue()
+        employee_sheets = get_sheet_names(employee_bytes)
+        employee_sheet = st.sidebar.selectbox(
+            "人员表工作表",
+            employee_sheets,
+            key="employee_sheet",
+        )
+        employee_df = read_excel_sheet(employee_bytes, employee_sheet)
+        employee_lookup = build_employee_lookup(employee_df)
+        st.sidebar.success(f"人员源数据已读取：{employee_lookup.source_rows:,} 行")
+        if employee_lookup.duplicate_keys:
+            st.sidebar.warning(
+                f"发现 {len(employee_lookup.duplicate_keys)} 个重复匹配键，程序保留首次出现的姓名。"
+            )
+
         acceptance_bytes = acceptance_file.getvalue()
         acceptance_sheets = get_sheet_names(acceptance_bytes)
         acceptance_sheet = st.sidebar.selectbox(
@@ -521,7 +450,6 @@ def render_app() -> None:
             result = calculate_acceptance_productivity(
                 acceptance_df=acceptance_df,
                 employee_lookup=employee_lookup,
-                gap_minutes=int(gap_minutes),
             )
     except Exception as exc:
         st.error(f"处理失败：{exc}")
@@ -545,19 +473,9 @@ def render_app() -> None:
         },
     )
 
-    st.caption("排名和汇总指标仅包含已成功匹配实际姓名的验收人员。")
+    st.caption(f"计入计算的有效记录：{result.included_row_count:,} 行。")
 
-    if not result.invalid_rows.empty:
-        st.warning(
-            f"共有 {len(result.invalid_rows):,} 行因账号、验收量或时间无效而未计入人效。"
-        )
-
-    st.caption(
-        f"有效记录：{result.valid_row_count:,}/{result.total_row_count:,} 行。"
-        f"当前连续工作间隔阈值：{int(gap_minutes)} 分钟。"
-    )
-
-    output_bytes = make_excel_output(result, int(gap_minutes))
+    output_bytes = make_excel_output(result)
     st.download_button(
         "下载验收人效结果 Excel",
         data=output_bytes,
@@ -568,13 +486,14 @@ def render_app() -> None:
 
     with st.expander("计算口径"):
         st.markdown(
-            f"""
-- **验收量**：按验收人汇总有效记录中的验收量。
-- **验收人账号**：自动从账号中去除括号和邮箱域名，例如 `US018958(US018958@jd.com)` 转为 `US018958`。
-- **实际姓名**：先匹配人员表中的用户编码/Use ID，再匹配 ERP；未匹配账号不进入排名和汇总。
-- **有效工作时长**：按验收人和日期合并重叠时间；相邻记录间隔不超过 **{int(gap_minutes)} 分钟**时视为连续工作。
+            """
+- **验收量**：按验收人汇总计入计算记录中的验收量。
+- **验收人账号**：自动去除括号和邮箱域名，例如 `US018958(US018958@jd.com)` 转为 `US018958`。
+- **实际姓名**：先匹配人员表中的用户编码/Use ID，再匹配 ERP；未匹配人员不呈现且不计入结果。
+- **单行有效工作时长**：最后验收时间 − 开始验收时间。
+- **个人总有效工作时长**：该人员所有单行有效工作时长直接相加，不合并重叠时间，也不判断间隔。
 - **小时人效**：验收量 ÷ 有效工作小时。
-- **总有效工作时长**：所有验收人的有效工作时长相加。
+- **总有效工作时长**：所有已匹配验收人的个人总有效工作时长相加。
 """
         )
 
