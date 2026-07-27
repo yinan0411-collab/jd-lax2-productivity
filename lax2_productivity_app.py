@@ -208,32 +208,48 @@ def format_duration(total_seconds: float) -> str:
 
 
 def merge_overlapping_seconds(group: pd.DataFrame) -> float:
-    """同一人员的重叠时间只计算一次；不使用额外的间隔阈值。"""
-    intervals = (
-        group[["开始时间", "结束时间"]]
-        .sort_values(["开始时间", "结束时间"])
-        .itertuples(index=False, name=None)
-    )
+    """按人员、按自然日去重重叠时间；不同日期分别计算。"""
+    daily_intervals: dict[object, list[tuple[pd.Timestamp, pd.Timestamp]]] = {}
+
+    for start, end in group[["开始时间", "结束时间"]].itertuples(
+        index=False, name=None
+    ):
+        # 跨午夜的记录拆分到各自自然日，确保只在同一天内去重。
+        segment_start = start
+        while segment_start.normalize() < end.normalize():
+            next_midnight = segment_start.normalize() + pd.Timedelta(days=1)
+            daily_intervals.setdefault(segment_start.date(), []).append(
+                (segment_start, next_midnight)
+            )
+            segment_start = next_midnight
+
+        if end > segment_start:
+            daily_intervals.setdefault(segment_start.date(), []).append(
+                (segment_start, end)
+            )
 
     total_seconds = 0.0
-    current_start: pd.Timestamp | None = None
-    current_end: pd.Timestamp | None = None
 
-    for start, end in intervals:
-        if current_start is None:
-            current_start, current_end = start, end
-            continue
+    for intervals in daily_intervals.values():
+        intervals.sort(key=lambda item: (item[0], item[1]))
+        current_start: pd.Timestamp | None = None
+        current_end: pd.Timestamp | None = None
 
-        # 重叠或首尾相接的区间合并；中间有空档则分别计算。
-        if start <= current_end:
-            if end > current_end:
-                current_end = end
-        else:
+        for start, end in intervals:
+            if current_start is None:
+                current_start, current_end = start, end
+                continue
+
+            # 仅合并同一自然日内重叠或首尾相接的区间。
+            if start <= current_end:
+                if end > current_end:
+                    current_end = end
+            else:
+                total_seconds += (current_end - current_start).total_seconds()
+                current_start, current_end = start, end
+
+        if current_start is not None and current_end is not None:
             total_seconds += (current_end - current_start).total_seconds()
-            current_start, current_end = start, end
-
-    if current_start is not None and current_end is not None:
-        total_seconds += (current_end - current_start).total_seconds()
 
     return float(total_seconds)
 
@@ -399,7 +415,7 @@ def make_excel_output(result: AcceptanceResult) -> bytes:
                 "计算口径": [
                     "按验收人汇总计入计算记录中的验收量",
                     "按验收人对京东入库单号去重计数；同一人员重复出现的同一单号只计1单",
-                    "合并同一验收人的开始至结束时间区间；实际重叠时间只计算一次，不使用额外间隔阈值",
+                    "按验收人、按自然日合并开始至结束时间区间；只去重同一天内的重叠时间，不使用额外间隔阈值",
                     "验收量 ÷ 有效工作小时",
                     "验收单量 ÷ 有效工作小时",
                     "先匹配用户编码/Use ID，再匹配ERP；账号中的@域名自动移除；未匹配人员不呈现且不计入结果",
@@ -554,7 +570,7 @@ def render_app() -> None:
 - **验收单量**：按人员统计唯一的“京东入库单号”；同一人员重复出现的同一单号只计1单。
 - **验收人账号**：自动去除括号和邮箱域名，例如 `US018958(US018958@jd.com)` 转为 `US018958`。
 - **实际姓名**：先匹配人员表中的用户编码/Use ID，再匹配 ERP；未匹配人员不呈现且不计入结果。
-- **个人总有效工作时长**：合并同一人员实际重叠的开始/结束时间区间，重叠部分只计算一次；不使用额外间隔阈值。
+- **个人总有效工作时长**：按验收人、按自然日处理时间区间；只去重发生在同一天内的重叠时间，不同日期分别计算；不使用额外间隔阈值。
 - **小时人效**：验收量 ÷ 有效工作小时。
 - **人效（单量）**：验收单量 ÷ 有效工作小时。
 - **总验收单量**：所有已匹配记录中的京东入库单号全局去重计数。
